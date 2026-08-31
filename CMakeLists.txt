@@ -29,8 +29,8 @@ target_include_directories(redis-lite-server PRIVATE include)
 # The tests. Plain executable; a non-zero exit code means failure, which is all
 # CTest looks at.
 enable_testing()
-add_executable(redis-lite-tests tests/tests.cpp)
-target_include_directories(redis-lite-tests PRIVATE include)
+add_executable(redis-lite-tests tests/tests.cpp src/resp.cpp)
+target_include_directories(redis-lite-tests PRIVATE include src)
 add_test(NAME redis-lite-tests COMMAND redis-lite-tests)
 
 # Stage 1 experiments: standalone TCP programs for learning the socket API.
