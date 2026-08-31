@@ -1,5 +1,7 @@
+#include <chrono>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "commands.hpp"
@@ -434,6 +436,186 @@ static void test_buffer_loop() {
     check(parse(buffer).status == ParseStatus::Incomplete, "the leftover is incomplete, not malformed");
 }
 
+// Expiration tests need real elapsed time. Durations are kept short but with
+// comfortable margins, so the suite stays quick without becoming flaky.
+static void sleep_ms(int milliseconds) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(milliseconds));
+}
+
+static void test_expire_basics() {
+    std::cout << "\n-- EXPIRE --\n";
+
+    Store store;
+    run(store, {"SET", "foo", "bar"});
+
+    check_equal(run(store, {"EXPIRE", "foo", "50"}), ":1\r\n", "EXPIRE on an existing key returns 1");
+    check_equal(run(store, {"EXPIRE", "nosuchkey", "50"}), ":0\r\n", "EXPIRE on a missing key returns 0");
+    check_equal(run(store, {"GET", "foo"}), "$3\r\nbar\r\n", "the key is still readable before it expires");
+    check_equal(run(store, {"TTL", "foo"}), ":50\r\n", "TTL reports the seconds just set");
+
+    // Re-running EXPIRE replaces the old deadline.
+    check_equal(run(store, {"EXPIRE", "foo", "80"}), ":1\r\n", "EXPIRE can be applied again");
+    check_equal(run(store, {"TTL", "foo"}), ":80\r\n", "the newer deadline replaces the older one");
+}
+
+static void test_ttl_meanings() {
+    std::cout << "\n-- TTL return values --\n";
+
+    Store store;
+    run(store, {"SET", "forever", "value"});
+
+    check_equal(run(store, {"TTL", "forever"}), ":-1\r\n", "TTL is -1 for a key with no expiration");
+    check_equal(run(store, {"TTL", "nosuchkey"}), ":-2\r\n", "TTL is -2 for a missing key");
+
+    run(store, {"EXPIRE", "forever", "30"});
+    check_equal(run(store, {"TTL", "forever"}), ":30\r\n", "TTL is the remaining seconds once set");
+}
+
+static void test_key_actually_expires() {
+    std::cout << "\n-- a key expires after its deadline --\n";
+
+    Store store;
+    run(store, {"SET", "foo", "bar"});
+    run(store, {"EXPIRE", "foo", "1"});
+
+    check_equal(run(store, {"GET", "foo"}), "$3\r\nbar\r\n", "GET before expiry returns the value");
+
+    sleep_ms(1200);
+
+    check_equal(run(store, {"GET", "foo"}), "$-1\r\n", "GET after expiry is null");
+    check_equal(run(store, {"TTL", "foo"}), ":-2\r\n", "TTL after expiry is -2");
+    check_equal(run(store, {"DEL", "foo"}), ":0\r\n", "DEL on an expired key returns 0");
+    check_equal(run(store, {"EXPIRE", "foo", "50"}), ":0\r\n", "EXPIRE on an expired key returns 0");
+
+    // The lazy sweep really removed it, rather than just hiding it.
+    check(store.values.count("foo") == 0, "the expired value is gone from the store");
+    check(store.expirations.count("foo") == 0, "the expired deadline is gone from the store");
+}
+
+static void test_ttl_decreases() {
+    std::cout << "\n-- TTL counts down --\n";
+
+    Store store;
+    run(store, {"SET", "foo", "bar"});
+    run(store, {"EXPIRE", "foo", "3"});
+
+    check_equal(run(store, {"TTL", "foo"}), ":3\r\n", "TTL starts at 3");
+
+    sleep_ms(1200);
+
+    check_equal(run(store, {"TTL", "foo"}), ":2\r\n", "TTL is 2 a second later");
+    check_equal(run(store, {"GET", "foo"}), "$3\r\nbar\r\n", "the key is still alive");
+}
+
+static void test_set_clears_ttl() {
+    std::cout << "\n-- SET clears an existing TTL --\n";
+
+    Store store;
+    run(store, {"SET", "foo", "bar"});
+    run(store, {"EXPIRE", "foo", "10"});
+    check_equal(run(store, {"TTL", "foo"}), ":10\r\n", "the TTL is set");
+
+    check_equal(run(store, {"SET", "foo", "new"}), "+OK\r\n", "the key is set again");
+    check_equal(run(store, {"TTL", "foo"}), ":-1\r\n", "SET removed the old TTL");
+    check_equal(run(store, {"GET", "foo"}), "$3\r\nnew\r\n", "the new value is in place");
+}
+
+static void test_del_clears_ttl() {
+    std::cout << "\n-- DEL clears expiration information --\n";
+
+    Store store;
+    run(store, {"SET", "foo", "bar"});
+    run(store, {"EXPIRE", "foo", "10"});
+
+    check_equal(run(store, {"DEL", "foo"}), ":1\r\n", "DEL removes the key");
+    check(store.expirations.count("foo") == 0, "DEL removed the deadline too");
+
+    // A stale deadline would wrongly expire this brand new key.
+    check_equal(run(store, {"SET", "foo", "fresh"}), "+OK\r\n", "the key is recreated");
+    check_equal(run(store, {"TTL", "foo"}), ":-1\r\n", "the recreated key has no TTL");
+}
+
+static void test_expire_edge_values() {
+    std::cout << "\n-- zero and negative expirations --\n";
+
+    Store store;
+
+    run(store, {"SET", "zero", "value"});
+    check_equal(run(store, {"EXPIRE", "zero", "0"}), ":1\r\n", "EXPIRE 0 reports success");
+    check_equal(run(store, {"GET", "zero"}), "$-1\r\n", "EXPIRE 0 removes the key immediately");
+    check_equal(run(store, {"TTL", "zero"}), ":-2\r\n", "the key removed by EXPIRE 0 is gone");
+
+    run(store, {"SET", "negative", "value"});
+    check_equal(run(store, {"EXPIRE", "negative", "-1"}), ":1\r\n", "EXPIRE -1 reports success");
+    check_equal(run(store, {"GET", "negative"}), "$-1\r\n", "EXPIRE -1 removes the key immediately");
+
+    check_equal(run(store, {"EXPIRE", "nosuchkey", "0"}), ":0\r\n", "EXPIRE 0 on a missing key returns 0");
+}
+
+static void test_expire_and_ttl_errors() {
+    std::cout << "\n-- invalid EXPIRE and TTL --\n";
+
+    Store store;
+    run(store, {"SET", "foo", "bar"});
+
+    const std::string not_a_number = run(store, {"EXPIRE", "foo", "abc"});
+    check(not_a_number.rfind("-ERR value is not an integer", 0) == 0,
+          "EXPIRE with a non-numeric time is an error");
+    check_equal(run(store, {"TTL", "foo"}), ":-1\r\n", "the failed EXPIRE set no TTL");
+
+    check(run(store, {"EXPIRE", "foo", "1.5"}).rfind("-ERR value is not an integer", 0) == 0,
+          "EXPIRE with a fractional time is an error");
+
+    check(run(store, {"EXPIRE"}).rfind("-ERR wrong number", 0) == 0, "EXPIRE with no arguments is an error");
+    check(run(store, {"EXPIRE", "foo"}).rfind("-ERR wrong number", 0) == 0, "EXPIRE without a time is an error");
+    check(run(store, {"EXPIRE", "foo", "10", "extra"}).rfind("-ERR wrong number", 0) == 0,
+          "EXPIRE with extra arguments is an error");
+
+    check(run(store, {"TTL"}).rfind("-ERR wrong number", 0) == 0, "TTL with no key is an error");
+    check(run(store, {"TTL", "foo", "extra"}).rfind("-ERR wrong number", 0) == 0,
+          "TTL with extra arguments is an error");
+
+    check_equal(run(store, {"GET", "foo"}), "$3\r\nbar\r\n", "invalid commands left the key alone");
+}
+
+static void test_independent_expirations() {
+    std::cout << "\n-- keys expire independently --\n";
+
+    Store store;
+    run(store, {"SET", "quick", "a"});
+    run(store, {"SET", "slow", "b"});
+    run(store, {"SET", "forever", "c"});
+    run(store, {"EXPIRE", "quick", "1"});
+    run(store, {"EXPIRE", "slow", "60"});
+
+    sleep_ms(1200);
+
+    check_equal(run(store, {"GET", "quick"}), "$-1\r\n", "the short-lived key expired");
+    check_equal(run(store, {"GET", "slow"}), "$1\r\nb\r\n", "the long-lived key survived");
+    check_equal(run(store, {"GET", "forever"}), "$1\r\nc\r\n", "the key with no TTL survived");
+    check_equal(run(store, {"TTL", "slow"}), ":59\r\n", "the survivor's TTL counted down");
+    check_equal(run(store, {"TTL", "forever"}), ":-1\r\n", "the key with no TTL still reports -1");
+}
+
+static void test_ttl_over_resp() {
+    std::cout << "\n-- EXPIRE and TTL over RESP --\n";
+
+    Store store;
+
+    check_equal(execute_bytes(store, "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n"),
+                "+OK\r\n", "SET over RESP");
+    check_equal(execute_bytes(store, "*3\r\n$6\r\nEXPIRE\r\n$3\r\nfoo\r\n$2\r\n30\r\n"),
+                ":1\r\n", "EXPIRE over RESP");
+    check_equal(execute_bytes(store, "*2\r\n$3\r\nTTL\r\n$3\r\nfoo\r\n"),
+                ":30\r\n", "TTL over RESP");
+    check_equal(execute_bytes(store, "*2\r\n$3\r\nttl\r\n$3\r\nfoo\r\n"),
+                ":30\r\n", "lowercase ttl over RESP");
+    check_equal(execute_bytes(store, "*3\r\n$6\r\nexpire\r\n$3\r\nfoo\r\n$1\r\n0\r\n"),
+                ":1\r\n", "lowercase expire over RESP");
+    check_equal(execute_bytes(store, "*2\r\n$3\r\nTTL\r\n$3\r\nfoo\r\n"),
+                ":-2\r\n", "the key expired by EXPIRE 0 reports -2");
+}
+
 int main() {
     std::cout << "running tests\n";
 
@@ -455,6 +637,16 @@ int main() {
     test_command_errors();
     test_resp_to_command_integration();
     test_buffer_loop();
+    test_expire_basics();
+    test_ttl_meanings();
+    test_key_actually_expires();
+    test_ttl_decreases();
+    test_set_clears_ttl();
+    test_del_clears_ttl();
+    test_expire_edge_values();
+    test_expire_and_ttl_errors();
+    test_independent_expirations();
+    test_ttl_over_resp();
 
     std::cout << "\n";
     if (failures == 0) {

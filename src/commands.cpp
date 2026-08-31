@@ -1,12 +1,15 @@
 #include "commands.hpp"
 
 #include <cctype>
+#include <charconv>
 
 namespace redis_lite {
 
     namespace {
 
-        //We use to_upper to make Command names are case-insensitive: ping, PING and PiNg are one command.
+        using Clock = std::chrono::steady_clock;
+
+        // Command names are case-insensitive: ping, PING and PiNg are one command.
         std::string to_upper(const std::string& text) {
             std::string out = text;
             for (char& c : out) {
@@ -15,14 +18,43 @@ namespace redis_lite {
             return out;
         }
 
+        // Strict integer conversion: the whole text must be a number.
+        bool to_integer(const std::string& text, long long& out) {
+            const std::from_chars_result result =
+                std::from_chars(text.data(), text.data() + text.size(), out);
+
+            return result.ec == std::errc() && result.ptr == text.data() + text.size();
+        }
+
         RespValue wrong_arity(const std::string& name) {
             return make_error("ERR wrong number of arguments for '" + name + "' command");
+        }
+
+        // A key and its deadline always go away together.
+        void remove_key(Store& store, const std::string& key) {
+            store.values.erase(key);
+            store.expirations.erase(key);
+        }
+
+        // Lazy expiration: drop the key if its deadline has passed. Called at the
+        // start of every command that touches a key, so an expired key looks
+        // exactly like a key that was never there.
+        void expire_if_due(Store& store, const std::string& key) {
+            const auto deadline = store.expirations.find(key);
+            if (deadline == store.expirations.end()) {
+                return;  // no expiration set
+            }
+            if (Clock::now() < deadline->second) {
+                return;  // not yet
+            }
+            remove_key(store, key);
         }
 
     }  // namespace
 
     RespValue execute_command(const RespValue& request, Store& store) {
-        // Clients send commands as an array of bulk strings; anything else is a client bug, not a command.
+        // Clients send commands as an array of bulk strings; anything else is
+        // a client bug, not a command.
         if (request.type != RespType::Array || request.is_null || request.elements.empty()) {
             return make_error("ERR expected a non-empty array of bulk strings");
         }
@@ -46,7 +78,9 @@ namespace redis_lite {
             if (argc != 3) {
                 return wrong_arity("set");
             }
-            store[request.elements[1].string] = request.elements[2].string;
+            const std::string& key = request.elements[1].string;
+            store.values[key] = request.elements[2].string;
+            store.expirations.erase(key);  // a fresh SET clears any old TTL
             return make_simple_string("OK");
         }
 
@@ -54,8 +88,11 @@ namespace redis_lite {
             if (argc != 2) {
                 return wrong_arity("get");
             }
-            const auto found = store.find(request.elements[1].string);
-            if (found == store.end()) {
+            const std::string& key = request.elements[1].string;
+            expire_if_due(store, key);
+
+            const auto found = store.values.find(key);
+            if (found == store.values.end()) {
                 return make_null_bulk_string();  // $-1: the key does not exist
             }
             return make_bulk_string(found->second);
@@ -65,8 +102,60 @@ namespace redis_lite {
             if (argc != 2) {
                 return wrong_arity("del");
             }
-            const bool erased = store.erase(request.elements[1].string) > 0;
-            return make_integer(erased ? 1 : 0);
+            const std::string& key = request.elements[1].string;
+            expire_if_due(store, key);
+
+            const bool existed = store.values.count(key) > 0;
+            remove_key(store, key);
+            return make_integer(existed ? 1 : 0);
+        }
+
+        if (name == "EXPIRE") {
+            if (argc != 3) {
+                return wrong_arity("expire");
+            }
+
+            long long seconds = 0;
+            if (!to_integer(request.elements[2].string, seconds)) {
+                return make_error("ERR value is not an integer or out of range");
+            }
+
+            const std::string& key = request.elements[1].string;
+            expire_if_due(store, key);
+
+            if (store.values.count(key) == 0) {
+                return make_integer(0);  // nothing to expire
+            }
+
+            // Redis deletes the key outright when the deadline is already past.
+            if (seconds <= 0) {
+                remove_key(store, key);
+                return make_integer(1);
+            }
+
+            store.expirations[key] = Clock::now() + std::chrono::seconds(seconds);
+            return make_integer(1);
+        }
+
+        if (name == "TTL") {
+            if (argc != 2) {
+                return wrong_arity("ttl");
+            }
+            const std::string& key = request.elements[1].string;
+            expire_if_due(store, key);
+
+            if (store.values.count(key) == 0) {
+                return make_integer(-2);  // missing, or already expired
+            }
+
+            const auto deadline = store.expirations.find(key);
+            if (deadline == store.expirations.end()) {
+                return make_integer(-1);  // exists, but lives forever
+            }
+
+            // Round up, so TTL immediately after EXPIRE key 10 reads 10, not 9.
+            const auto remaining = deadline->second - Clock::now();
+            return make_integer(std::chrono::ceil<std::chrono::seconds>(remaining).count());
         }
 
         return make_error("ERR unknown command '" + request.elements[0].string + "'");
