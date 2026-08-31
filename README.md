@@ -13,23 +13,22 @@ over abstractions that might pay off later.
 
 ## Status
 
-**Stages 0–5 complete. The server speaks Redis for a six-command subset, with TTL.**
+**Stages 0–6 complete. A threaded server speaking Redis for a six-command subset, with TTL.**
 
 What exists today:
 
 - A CMake build (C++17, warnings enabled) producing four executables.
-- `redis-lite-server`, which listens on **127.0.0.1:6379**, accepts one client at a time, and
-  executes `PING`, `SET`, `GET`, `DEL`, `EXPIRE` and `TTL` over RESP until Ctrl+C.
+- `redis-lite-server`, which listens on **127.0.0.1:6379**, serves **many clients at once**
+  (one thread each), and executes `PING`, `SET`, `GET`, `DEL`, `EXPIRE` and `TTL` over RESP
+  until Ctrl+C.
 - A RESP2 parser and serializer (`src/resp.hpp`, `src/resp.cpp`), now driving the server.
 - A command layer (`src/commands.hpp`, `src/commands.cpp`) holding the key-value store and
   its expiration deadlines.
-- `redis-lite-tests`, a plain test executable wired into CTest (189 checks).
+- `redis-lite-tests`, a plain test executable wired into CTest (200 checks).
 - `tcp-echo-server` and `tcp-echo-client` in `experiments/` — the Stage 1 exercise, kept as-is.
 
-What does **not** exist yet: every other Redis command, persistence, and any form of
-concurrency. The server is **sequential**: a second client waits in the kernel's
-backlog until the first one disconnects. Every stage below marked *planned* describes intent,
-not shipped code.
+What does **not** exist yet: every other Redis command, persistence, and event-driven I/O.
+Every stage below marked *planned* describes intent, not shipped code.
 
 ## Stage 3: the RESP protocol
 
@@ -287,6 +286,122 @@ printf '*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n'    | nc -w2 127.0.0.1 6379   # $-1
 printf '*2\r\n$3\r\nTTL\r\n$3\r\nfoo\r\n'    | nc -w2 127.0.0.1 6379   # :-2
 ```
 
+## Stage 6: concurrent clients with threads
+
+### The problem with the sequential server
+
+Through Stage 5 the accept loop did this:
+
+```
+accept client A  ->  handle A until it disconnects  ->  accept client B
+```
+
+`handle_client` blocks in `recv()` waiting for A to say something. If A connects and then goes
+quiet — or is simply slow, or idle — B is not merely slow to be served, it is not served *at
+all*. It sits in the kernel's backlog queue until A hangs up. One idle client denies service to
+everyone.
+
+### One thread per client
+
+Now `accept()` hands the connection to a new thread and immediately loops back to accept the
+next one:
+
+```cpp
+client_threads.emplace_back(handle_client,
+                            client_fd,
+                            std::ref(store),
+                            std::ref(store_mutex));
+```
+
+Each client gets its own `std::thread` running the same `handle_client` as before. The
+per-connection buffering, parsing and command execution did not change at all — the only
+difference is how many of them run at once.
+
+### Why the store now needs a mutex
+
+The sequential server never needed synchronisation, and it is worth being precise about why:
+there was exactly **one** thread. Commands ran strictly one after another, so the store could
+never be observed halfway through a modification.
+
+```
+before:   client A -> execute -> client B -> execute        (one thread, no overlap)
+
+now:      thread A --+
+                     +--> shared Store
+          thread B --+                                       (two threads, real overlap)
+```
+
+`std::unordered_map` is not thread-safe for concurrent modification. Two threads inserting at
+once can corrupt the bucket list, and a rehash triggered by one thread moves nodes another
+thread is reading. The result is not a wrong answer, it is undefined behaviour.
+
+A **mutex** (mutual exclusion) fixes this by allowing only one thread inside a region of code
+at a time. A thread that tries to lock a mutex another thread already holds is put to sleep
+until it is released. `std::lock_guard` locks on construction and unlocks on destruction, so
+the lock is released even if the guarded code returns early or throws.
+
+Both `values` and `expirations` are covered by the same single mutex, because they are one
+logical state: `DEL` writes to both, and a thread must never see a key removed from one but
+still present in the other.
+
+### Why the lock is not held during network I/O
+
+Only the store access is inside the critical section:
+
+```cpp
+RespValue reply;
+{
+    std::lock_guard<std::mutex> lock(store_mutex);
+    reply = execute_command(result.value, store);
+}
+send_reply(client_fd, serialize(reply));   // outside the lock
+```
+
+`recv()` and `send()` can block for an unbounded time — a client might not send its next
+command for an hour. Holding the mutex across `recv()` would mean one idle client freezing
+every other client out of the store, which would re-create the exact problem threads were
+introduced to solve. The mutex protects the *data*, not the socket, so it is held for
+microseconds rather than minutes.
+
+### Shutdown
+
+Ctrl+C (or `SIGTERM`) sets the shutdown flag, `accept()` returns with `EINTR`, and the
+listening socket is closed, so no new clients are accepted. The server then **joins** its
+client threads, letting each connected client finish naturally.
+
+The tradeoff is that shutdown waits for connected clients to disconnect: an idle open
+connection will keep the server alive. Joining is the simple, safe choice — detaching the
+threads instead would let `run_server` return while threads are still using the `Store` that
+lives in its stack frame, which is undefined behaviour. Forcibly waking the threads would mean
+tracking every client socket and shutting each one down, which is more machinery than this
+stage needs.
+
+### Known limitation: this is not the final architecture
+
+One thread per client is intentionally the simplest design that works, and it is the right
+thing to learn first. But:
+
+- **Every client costs a thread**, and a thread costs memory — typically around 512 KB to 8 MB
+  of stack reserved per thread. A thousand idle clients means a thousand threads.
+- **Most of those threads do nothing.** They sit blocked in `recv()` waiting for input, using
+  a whole OS thread to represent "waiting".
+- **Context switching** between many threads costs real time, and every command serialises on
+  the one mutex anyway.
+
+Real Redis handles tens of thousands of connections with a **single** thread, by asking the
+kernel which sockets have data ready (`epoll` on Linux, `kqueue` on the BSDs and macOS) and
+handling only those. That is event-driven I/O, and it is what would eventually replace this.
+
+### Demonstration script
+
+```bash
+./demo_concurrency.sh
+```
+
+It starts a server, connects a client that stays silent for 12 seconds, shows other clients
+being served during that window, then demonstrates shared state, two simultaneous clients on
+different keys, and TTL — then shuts everything down.
+
 ## Trying the server
 
 ```bash
@@ -346,10 +461,11 @@ and port 6380 rather than 6379 so it never collides with a real Redis.
 | 3 | RESP protocol: parse requests, serialize replies | **Done** |
 | 4 | Core commands: `PING`, `SET`, `GET`, `DEL` | **Done** |
 | 5 | Expiration: `EXPIRE`, `TTL`, lazy eviction | **Done** |
-| 6 | Event loop: non-blocking I/O, many concurrent clients | Planned |
-| 7 | Richer data types: lists, hashes, sets | Planned |
-| 8 | Persistence: snapshotting, and an append-only log | Planned |
-| 9 | Benchmarks and tuning | Planned |
+| 6 | Concurrency: one thread per client, mutex-guarded store | **Done** |
+| 7 | Event loop: non-blocking I/O in a single thread | Planned |
+| 8 | Richer data types: lists, hashes, sets | Planned |
+| 9 | Persistence: snapshotting, and an append-only log | Planned |
+| 10 | Benchmarks and tuning | Planned |
 
 Stage boundaries may shift; the table records the intended order.
 
@@ -361,6 +477,7 @@ Stage boundaries may shift; the table records the intended order.
 ├── include/         shared headers (empty until a header is needed)
 ├── tests/           test executable, run via CTest
 ├── experiments/     standalone learning exercises, not part of the server
+├── demo_concurrency.sh  scripted demonstration of concurrent clients
 └── benchmarks/      reserved for a later stage; empty
 ```
 

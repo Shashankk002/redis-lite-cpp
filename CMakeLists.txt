@@ -22,6 +22,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # add an MSVC branch (/W4) if this ever needs to build on Windows.
 add_compile_options(-Wall -Wextra -Wpedantic)
 
+# std::thread needs the platform's threading library on some toolchains.
+find_package(Threads REQUIRED)
+
 # The server.
 add_executable(redis-lite-server
     src/main.cpp
@@ -29,6 +32,7 @@ add_executable(redis-lite-server
     src/resp.cpp
     src/commands.cpp)
 target_include_directories(redis-lite-server PRIVATE include)
+target_link_libraries(redis-lite-server PRIVATE Threads::Threads)
 
 # The tests. Plain executable; a non-zero exit code means failure, which is all
 # CTest looks at.
@@ -38,6 +42,7 @@ add_executable(redis-lite-tests
     src/resp.cpp
     src/commands.cpp)
 target_include_directories(redis-lite-tests PRIVATE include src)
+target_link_libraries(redis-lite-tests PRIVATE Threads::Threads)
 add_test(NAME redis-lite-tests COMMAND redis-lite-tests)
 
 # Stage 1 experiments: standalone TCP programs for learning the socket API.

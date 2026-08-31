@@ -1,5 +1,6 @@
 #include <chrono>
 #include <iostream>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <vector>
@@ -616,6 +617,190 @@ static void test_ttl_over_resp() {
                 ":-2\r\n", "the key expired by EXPIRE 0 reports -2");
 }
 
+// Runs a command the way the threaded server does: the mutex is held for the
+// store access only, and released before anything else happens.
+static std::string run_locked(Store& store,
+                              std::mutex& store_mutex,
+                              const std::vector<std::string>& args) {
+    std::vector<RespValue> elements;
+    for (const std::string& arg : args) {
+        elements.push_back(redis_lite::make_bulk_string(arg));
+    }
+    const RespValue request = redis_lite::make_array(elements);
+
+    RespValue reply;
+    {
+        std::lock_guard<std::mutex> lock(store_mutex);
+        reply = execute_command(request, store);
+    }
+    return serialize(reply);
+}
+
+static void test_concurrent_independent_keys() {
+    std::cout << "\n-- concurrent clients, one key each --\n";
+
+    Store store;
+    std::mutex store_mutex;
+
+    const int client_count = 8;
+    const int writes_per_client = 250;
+
+    std::vector<std::thread> clients;
+    for (int id = 0; id < client_count; ++id) {
+        clients.emplace_back([&store, &store_mutex, id]() {
+            const std::string key = "client" + std::to_string(id);
+            for (int i = 0; i < writes_per_client; ++i) {
+                run_locked(store, store_mutex, {"SET", key, std::to_string(i)});
+                run_locked(store, store_mutex, {"GET", key});
+                run_locked(store, store_mutex, {"TTL", key});
+            }
+        });
+    }
+    for (std::thread& client : clients) {
+        client.join();
+    }
+
+    check(store.values.size() == static_cast<std::size_t>(client_count),
+          "every client's key survived, and no others appeared");
+
+    bool all_correct = true;
+    for (int id = 0; id < client_count; ++id) {
+        const std::string expected = "$3\r\n249\r\n";
+        if (run(store, {"GET", "client" + std::to_string(id)}) != expected) {
+            all_correct = false;
+        }
+    }
+    check(all_correct, "each key holds the last value its own client wrote");
+}
+
+static void test_concurrent_shared_key() {
+    std::cout << "\n-- concurrent clients, one shared key --\n";
+
+    Store store;
+    std::mutex store_mutex;
+
+    // Every client writes its own id to the same key, then reads it back. The
+    // read may see another client's value -- that is normal, interleaved
+    // access. What must never happen is a torn or invalid value.
+    const int client_count = 8;
+    std::vector<std::thread> clients;
+    bool values_always_valid = true;
+    std::mutex result_mutex;
+
+    for (int id = 0; id < client_count; ++id) {
+        clients.emplace_back([&, id]() {
+            for (int i = 0; i < 300; ++i) {
+                run_locked(store, store_mutex, {"SET", "shared", std::to_string(id)});
+
+                const std::string reply = run_locked(store, store_mutex, {"GET", "shared"});
+                // A single-digit bulk string reply is exactly "$1\r\nX\r\n" = 7 bytes.
+                const bool looks_valid = reply.size() == 7 &&
+                                         reply.rfind("$1\r\n", 0) == 0 &&
+                                         reply[4] >= '0' && reply[4] <= '7';
+                if (!looks_valid) {
+                    std::lock_guard<std::mutex> lock(result_mutex);
+                    values_always_valid = false;
+                }
+            }
+        });
+    }
+    for (std::thread& client : clients) {
+        client.join();
+    }
+
+    check(values_always_valid, "a shared key always reads back as a whole, valid value");
+    check(store.values.count("shared") == 1, "the shared key exists exactly once");
+}
+
+static void test_concurrent_ttl() {
+    std::cout << "\n-- TTL under concurrent access --\n";
+
+    Store store;
+    std::mutex store_mutex;
+
+    // Half the clients keep setting expirations, half keep reading them, on
+    // keys they share. Expirations and values are one logical state, so the
+    // same mutex covers both.
+    std::vector<std::thread> clients;
+    for (int id = 0; id < 4; ++id) {
+        clients.emplace_back([&store, &store_mutex, id]() {
+            const std::string key = "ttlkey" + std::to_string(id % 2);
+            for (int i = 0; i < 300; ++i) {
+                run_locked(store, store_mutex, {"SET", key, "value"});
+                run_locked(store, store_mutex, {"EXPIRE", key, "60"});
+                run_locked(store, store_mutex, {"TTL", key});
+                run_locked(store, store_mutex, {"DEL", key});
+            }
+        });
+    }
+    for (std::thread& client : clients) {
+        client.join();
+    }
+
+    // Every DEL removes both halves, so nothing may be left behind.
+    check(store.expirations.size() <= store.values.size(),
+          "no expiration outlives the key it belongs to");
+
+    // And expiration still behaves normally afterwards.
+    run_locked(store, store_mutex, {"SET", "after", "value"});
+    run_locked(store, store_mutex, {"EXPIRE", "after", "1"});
+    check_equal(run_locked(store, store_mutex, {"TTL", "after"}), ":1\r\n",
+                "TTL still works after the concurrent run");
+
+    sleep_ms(1200);
+    check_equal(run_locked(store, store_mutex, {"GET", "after"}), "$-1\r\n",
+                "the key still expires after the concurrent run");
+}
+
+static void test_one_client_sets_another_gets() {
+    std::cout << "\n-- one client SETs, another GETs --\n";
+
+    Store store;
+    std::mutex store_mutex;
+
+    std::string writer_reply;
+    std::thread writer([&]() {
+        writer_reply = run_locked(store, store_mutex, {"SET", "foo", "bar"});
+    });
+    writer.join();
+
+    std::string reader_reply;
+    std::thread reader([&]() {
+        reader_reply = run_locked(store, store_mutex, {"GET", "foo"});
+    });
+    reader.join();
+
+    check_equal(writer_reply, "+OK\r\n", "the writing client got +OK");
+    check_equal(reader_reply, "$3\r\nbar\r\n", "the reading client saw the other client's value");
+}
+
+static void test_concurrent_pings() {
+    std::cout << "\n-- independent PINGs --\n";
+
+    Store store;
+    std::mutex store_mutex;
+
+    std::vector<std::string> replies(4);
+    std::vector<std::thread> clients;
+    for (int id = 0; id < 4; ++id) {
+        clients.emplace_back([&replies, &store, &store_mutex, id]() {
+            replies[static_cast<std::size_t>(id)] = run_locked(store, store_mutex, {"PING"});
+        });
+    }
+    for (std::thread& client : clients) {
+        client.join();
+    }
+
+    bool all_pong = true;
+    for (const std::string& reply : replies) {
+        if (reply != "+PONG\r\n") {
+            all_pong = false;
+        }
+    }
+    check(all_pong, "every client got its own +PONG");
+    check(store.values.empty(), "PING touched no keys");
+}
+
 int main() {
     std::cout << "running tests\n";
 
@@ -647,6 +832,11 @@ int main() {
     test_expire_and_ttl_errors();
     test_independent_expirations();
     test_ttl_over_resp();
+    test_concurrent_pings();
+    test_one_client_sets_another_gets();
+    test_concurrent_independent_keys();
+    test_concurrent_shared_key();
+    test_concurrent_ttl();
 
     std::cout << "\n";
     if (failures == 0) {

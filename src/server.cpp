@@ -8,7 +8,10 @@
 #include <cerrno>   
 #include <cstdio>
 #include <iostream>
+#include <mutex>
 #include <string>
+#include <thread>
+#include <vector>
 
 #include "commands.hpp"
 #include "resp.hpp"
@@ -38,7 +41,7 @@ namespace redis_lite {
             return true;
         }
 
-        void handle_client(int client_fd, Store& store) {
+        void handle_client(int client_fd, Store& store, std::mutex& store_mutex) {
             std::string buffer;
             char chunk[1024];
             bool connected = true;
@@ -81,7 +84,13 @@ namespace redis_lite {
                         std::cout << "command: " << result.value.elements[0].string << "\n";
                     }
 
-                    const RespValue reply = execute_command(result.value, store);
+                    // The mutex guards the shared store and nothing else: it is held for the command only, never across recv() or send().
+                    RespValue reply;
+                    {
+                        std::lock_guard<std::mutex> lock(store_mutex);
+                        reply = execute_command(result.value, store);
+                    }
+
                     if (!send_reply(client_fd, serialize(reply))) {
                         connected = false;
                         break;
@@ -133,6 +142,8 @@ namespace redis_lite {
         std::cout << "Redis-Lite server listening on 127.0.0.1:" << port << "\n";
 
         Store store;
+        std::mutex store_mutex;          // guards `store` across client threads
+        std::vector<std::thread> client_threads;
 
         while (g_running) {
             int client_fd = accept(listen_fd, nullptr, nullptr);
@@ -144,12 +155,23 @@ namespace redis_lite {
                 break;
             }
 
-            std::cout << "client connected\n";
-            handle_client(client_fd, store);
+            std::cout << ("client connected (fd " + std::to_string(client_fd) + ")\n");
+            client_threads.emplace_back(handle_client,
+                                        client_fd,
+                                        std::ref(store),
+                                        std::ref(store_mutex));
         }
 
+        // Stop accepting first, then let the connected clients finish. A thread sitting in recv() returns when its client disconnects.
         close(listen_fd);
-        std::cout << "\nRedis-Lite server shutting down\n";
+        std::cout << "\nRedis-Lite server shutting down; waiting for "
+                  << client_threads.size() << " client thread(s)\n";
+
+        for (std::thread& thread : client_threads) {
+            thread.join();
+        }
+
+        std::cout << "all client threads finished\n";
         return 0;
     }
 
