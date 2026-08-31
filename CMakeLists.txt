@@ -23,13 +23,20 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_compile_options(-Wall -Wextra -Wpedantic)
 
 # The server.
-add_executable(redis-lite-server src/main.cpp src/server.cpp)
+add_executable(redis-lite-server
+    src/main.cpp
+    src/server.cpp
+    src/resp.cpp
+    src/commands.cpp)
 target_include_directories(redis-lite-server PRIVATE include)
 
 # The tests. Plain executable; a non-zero exit code means failure, which is all
 # CTest looks at.
 enable_testing()
-add_executable(redis-lite-tests tests/tests.cpp src/resp.cpp)
+add_executable(redis-lite-tests
+    tests/tests.cpp
+    src/resp.cpp
+    src/commands.cpp)
 target_include_directories(redis-lite-tests PRIVATE include src)
 add_test(NAME redis-lite-tests COMMAND redis-lite-tests)
 

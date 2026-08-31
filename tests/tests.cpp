@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 
+#include "commands.hpp"
 #include "resp.hpp"
 
 using redis_lite::ParseResult;
@@ -10,6 +11,8 @@ using redis_lite::parse;
 using redis_lite::RespType;
 using redis_lite::RespValue;
 using redis_lite::serialize;
+using redis_lite::Store;
+using redis_lite::execute_command;
 
 static int failures = 0;
 
@@ -271,6 +274,166 @@ static void test_round_trips() {
     check_round_trip("*2\r\n*2\r\n:1\r\n:2\r\n+OK\r\n", "nested array");
 }
 
+// Builds a request array from plain strings and executes it, the way a client
+// would: run(store, {"SET", "name", "Shashank"}).
+static std::string run(Store& store, const std::vector<std::string>& args) {
+    std::vector<RespValue> elements;
+    for (const std::string& arg : args) {
+        elements.push_back(redis_lite::make_bulk_string(arg));
+    }
+    return serialize(execute_command(redis_lite::make_array(elements), store));
+}
+
+// The full path: RESP bytes -> parse -> execute -> serialize -> RESP bytes.
+static std::string execute_bytes(Store& store, const std::string& request) {
+    const ParseResult parsed = parse(request);
+    if (parsed.status != ParseStatus::Ok) {
+        return "<parse failed: " + status_name(parsed.status) + ">";
+    }
+    return serialize(execute_command(parsed.value, store));
+}
+
+static void test_ping() {
+    std::cout << "\n-- PING --\n";
+
+    Store store;
+    check_equal(run(store, {"PING"}), "+PONG\r\n", "PING replies +PONG");
+}
+
+static void test_set_and_get() {
+    std::cout << "\n-- SET and GET --\n";
+
+    Store store;
+    check_equal(run(store, {"SET", "name", "Shashank"}), "+OK\r\n", "SET replies +OK");
+    check_equal(run(store, {"GET", "name"}), "$8\r\nShashank\r\n", "GET returns the value");
+    check_equal(run(store, {"GET", "missing"}), "$-1\r\n", "GET on a missing key is null");
+
+    // Several keys coexist.
+    check_equal(run(store, {"SET", "city", "Hyderabad"}), "+OK\r\n", "a second key can be set");
+    check_equal(run(store, {"GET", "city"}), "$9\r\nHyderabad\r\n", "the second key reads back");
+    check_equal(run(store, {"GET", "name"}), "$8\r\nShashank\r\n", "the first key is untouched");
+
+    // Overwriting replaces the value.
+    check_equal(run(store, {"SET", "name", "Kanneboina"}), "+OK\r\n", "an existing key can be set again");
+    check_equal(run(store, {"GET", "name"}), "$10\r\nKanneboina\r\n", "the new value replaces the old");
+
+    // Values are opaque bytes, not text.
+    check_equal(run(store, {"SET", "empty", ""}), "+OK\r\n", "an empty value can be stored");
+    check_equal(run(store, {"GET", "empty"}), "$0\r\n\r\n", "an empty value is not the same as missing");
+}
+
+static void test_del() {
+    std::cout << "\n-- DEL --\n";
+
+    Store store;
+    run(store, {"SET", "name", "Shashank"});
+
+    check_equal(run(store, {"DEL", "name"}), ":1\r\n", "DEL on an existing key returns 1");
+    check_equal(run(store, {"GET", "name"}), "$-1\r\n", "the key is gone afterwards");
+    check_equal(run(store, {"DEL", "name"}), ":0\r\n", "DEL on a missing key returns 0");
+    check_equal(run(store, {"DEL", "never-existed"}), ":0\r\n", "DEL on an unknown key returns 0");
+}
+
+static void test_case_insensitivity() {
+    std::cout << "\n-- case-insensitive command names --\n";
+
+    Store store;
+    check_equal(run(store, {"ping"}), "+PONG\r\n", "lowercase ping works");
+    check_equal(run(store, {"PiNg"}), "+PONG\r\n", "mixed-case PiNg works");
+    check_equal(run(store, {"set", "k", "v"}), "+OK\r\n", "lowercase set works");
+    check_equal(run(store, {"GeT", "k"}), "$1\r\nv\r\n", "mixed-case GeT works");
+    check_equal(run(store, {"dEl", "k"}), ":1\r\n", "mixed-case dEl works");
+
+    // Keys, unlike command names, are case-sensitive.
+    run(store, {"SET", "Key", "upper"});
+    check_equal(run(store, {"GET", "key"}), "$-1\r\n", "keys stay case-sensitive");
+}
+
+static void test_command_errors() {
+    std::cout << "\n-- invalid commands --\n";
+
+    Store store;
+
+    const std::string unknown = run(store, {"FLUSHALL"});
+    check(unknown.rfind("-ERR unknown command", 0) == 0, "an unknown command is an error");
+    check(unknown.find("FLUSHALL") != std::string::npos, "the error names the command");
+
+    check(run(store, {"GET"}).rfind("-ERR wrong number", 0) == 0, "GET with no key is an error");
+    check(run(store, {"GET", "a", "b"}).rfind("-ERR wrong number", 0) == 0, "GET with two keys is an error");
+    check(run(store, {"SET"}).rfind("-ERR wrong number", 0) == 0, "SET with no arguments is an error");
+    check(run(store, {"SET", "a"}).rfind("-ERR wrong number", 0) == 0, "SET without a value is an error");
+    check(run(store, {"SET", "a", "b", "c"}).rfind("-ERR wrong number", 0) == 0, "SET with extra arguments is an error");
+    check(run(store, {"DEL"}).rfind("-ERR wrong number", 0) == 0, "DEL with no key is an error");
+    check(run(store, {"PING", "extra"}).rfind("-ERR wrong number", 0) == 0, "PING with an argument is an error");
+
+    // Requests that are not an array of bulk strings at all.
+    check(serialize(execute_command(redis_lite::make_simple_string("PING"), store))
+              .rfind("-ERR", 0) == 0,
+          "a non-array request is an error");
+    check(serialize(execute_command(redis_lite::make_array({}), store)).rfind("-ERR", 0) == 0,
+          "an empty array is an error");
+    check(serialize(execute_command(redis_lite::make_array({redis_lite::make_integer(1)}), store))
+              .rfind("-ERR", 0) == 0,
+          "an array of non-bulk-strings is an error");
+
+    // A failed command must not disturb stored data.
+    run(store, {"SET", "survivor", "yes"});
+    run(store, {"NOPE"});
+    check_equal(run(store, {"GET", "survivor"}), "$3\r\nyes\r\n", "a bad command leaves the store intact");
+}
+
+static void test_resp_to_command_integration() {
+    std::cout << "\n-- RESP bytes -> command -> RESP bytes --\n";
+
+    Store store;
+
+    check_equal(execute_bytes(store, "*1\r\n$4\r\nPING\r\n"),
+                "+PONG\r\n", "PING over RESP");
+    check_equal(execute_bytes(store, "*3\r\n$3\r\nSET\r\n$4\r\nname\r\n$8\r\nShashank\r\n"),
+                "+OK\r\n", "SET over RESP");
+    check_equal(execute_bytes(store, "*2\r\n$3\r\nGET\r\n$4\r\nname\r\n"),
+                "$8\r\nShashank\r\n", "GET over RESP");
+    check_equal(execute_bytes(store, "*2\r\n$3\r\nDEL\r\n$4\r\nname\r\n"),
+                ":1\r\n", "DEL over RESP");
+    check_equal(execute_bytes(store, "*2\r\n$3\r\nGET\r\n$4\r\nname\r\n"),
+                "$-1\r\n", "GET over RESP after DEL is null");
+}
+
+static void test_buffer_loop() {
+    std::cout << "\n-- several commands in one buffer --\n";
+
+    // Exactly what the server does with the bytes one recv() handed it.
+    Store store;
+    std::string buffer =
+        "*1\r\n$4\r\nPING\r\n"
+        "*3\r\n$3\r\nSET\r\n$4\r\nname\r\n$8\r\nShashank\r\n"
+        "*2\r\n$3\r\nGET\r\n$4\r\nname\r\n";
+
+    std::vector<std::string> replies;
+    while (true) {
+        const ParseResult result = parse(buffer);
+        if (result.status != ParseStatus::Ok) {
+            break;
+        }
+        replies.push_back(serialize(execute_command(result.value, store)));
+        buffer.erase(0, result.consumed);
+    }
+
+    check(replies.size() == 3, "three commands in one buffer produce three replies");
+    check_equal(replies[0], "+PONG\r\n", "reply 1 is +PONG");
+    check_equal(replies[1], "+OK\r\n", "reply 2 is +OK");
+    check_equal(replies[2], "$8\r\nShashank\r\n", "reply 3 is the stored value");
+    check(buffer.empty(), "the buffer is fully consumed");
+
+    // A trailing partial command stays in the buffer untouched.
+    buffer = "*1\r\n$4\r\nPING\r\n*2\r\n$3\r\nGET\r\n";
+    const ParseResult first = parse(buffer);
+    check(first.status == ParseStatus::Ok, "the complete command parses");
+    buffer.erase(0, first.consumed);
+    check_equal(buffer, "*2\r\n$3\r\nGET\r\n", "the partial command is preserved");
+    check(parse(buffer).status == ParseStatus::Incomplete, "the leftover is incomplete, not malformed");
+}
+
 int main() {
     std::cout << "running tests\n";
 
@@ -285,6 +448,13 @@ int main() {
     test_crlf_handling();
     test_serialization();
     test_round_trips();
+    test_ping();
+    test_set_and_get();
+    test_del();
+    test_case_insensitivity();
+    test_command_errors();
+    test_resp_to_command_integration();
+    test_buffer_loop();
 
     std::cout << "\n";
     if (failures == 0) {

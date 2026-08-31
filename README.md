@@ -13,20 +13,19 @@ over abstractions that might pay off later.
 
 ## Status
 
-**Stages 0–3 complete. No Redis commands are executed yet.**
+**Stages 0–4 complete. The server speaks Redis for a four-command subset.**
 
 What exists today:
 
 - A CMake build (C++17, warnings enabled) producing four executables.
-- `redis-lite-server`, which now listens on **127.0.0.1:6379**, accepts one client at a time,
-  echoes back whatever it receives, and keeps accepting new clients until Ctrl+C. It does not
-  understand a single Redis command yet.
-- A RESP2 parser and serializer (`src/resp.hpp`, `src/resp.cpp`). It is **not connected to
-  the server yet** — it is a self-contained protocol layer covered by unit tests.
-- `redis-lite-tests`, a plain test executable wired into CTest (89 checks).
+- `redis-lite-server`, which listens on **127.0.0.1:6379**, accepts one client at a time, and
+  executes `PING`, `SET`, `GET` and `DEL` over RESP until Ctrl+C.
+- A RESP2 parser and serializer (`src/resp.hpp`, `src/resp.cpp`), now driving the server.
+- A command layer (`src/commands.hpp`, `src/commands.cpp`) holding the key-value store.
+- `redis-lite-tests`, a plain test executable wired into CTest (136 checks).
 - `tcp-echo-server` and `tcp-echo-client` in `experiments/` — the Stage 1 exercise, kept as-is.
 
-What does **not** exist yet: commands, key-value storage, TTL/expiration, persistence, and any
+What does **not** exist yet: every other Redis command, TTL/expiration, persistence, and any
 form of concurrency. The server is **sequential**: a second client waits in the kernel's
 backlog until the first one disconnects. Every stage below marked *planned* describes intent,
 not shipped code.
@@ -87,6 +86,112 @@ Nothing executes commands. Parsing `GET name` produces an array of two bulk stri
 there; there is no key-value store, no dispatch, and the TCP server still echoes raw bytes
 without consulting this code at all. Wiring the two together is a later stage.
 
+## Stage 4: executing commands
+
+### What a "command" actually is
+
+Stage 3 turned bytes into a `RespValue`. That is still just data — knowing the client sent an
+array of two bulk strings says nothing about what should happen. Command execution is the step
+that gives those values *meaning*: the first element of the array is the command name, and the
+rest are its arguments.
+
+```
+["GET", "name"]   ->  command = GET, key = name
+```
+
+Redis command names are case-insensitive, so the name is upper-cased before dispatch: `ping`,
+`PING` and `PiNg` are the same command. Keys are **not** normalised — `Key` and `key` are two
+different keys, exactly as in Redis.
+
+### The commands
+
+| Command | Request | Reply |
+| ------- | ------- | ----- |
+| `PING` | `*1\r\n$4\r\nPING\r\n` | `+PONG\r\n` |
+| `SET key value` | `*3\r\n$3\r\nSET\r\n$4\r\nname\r\n$8\r\nShashank\r\n` | `+OK\r\n` |
+| `GET key` (exists) | `*2\r\n$3\r\nGET\r\n$4\r\nname\r\n` | `$8\r\nShashank\r\n` |
+| `GET key` (missing) | same | `$-1\r\n` (null bulk string) |
+| `DEL key` (existed) | `*2\r\n$3\r\nDEL\r\n$4\r\nname\r\n` | `:1\r\n` |
+| `DEL key` (missing) | same | `:0\r\n` |
+
+Anything else is answered with a RESP error rather than a crash:
+
+```
+unknown command       -ERR unknown command 'FLUSHALL'
+wrong argument count  -ERR wrong number of arguments for 'get' command
+not an array          -ERR expected a non-empty array of bulk strings
+broken RESP           -ERR Protocol error: unknown RESP type byte   (connection then closed)
+```
+
+### The request/response flow
+
+```
+client
+  |  bytes
+  v
+recv()                      may deliver half a command, or three commands
+  |
+append to per-client buffer
+  |
+parse(buffer)               Stage 3
+  |-- Incomplete  -> go back to recv() and wait for more
+  |-- Malformed   -> reply with an error, close the connection
+  |-- Ok          -> a RespValue, plus how many bytes it used
+  v
+execute_command(value, store)
+  |
+serialize(reply)            Stage 3
+  |
+send()
+  |
+buffer.erase(0, consumed)   leftovers are the next command
+  |
+loop
+```
+
+The buffer is the part that matters. TCP has no message boundaries, so the server never
+assumes one `recv()` equals one command: it appends what arrived, executes every *complete*
+command in the buffer, and keeps the remainder for next time.
+
+### Storage
+
+A single `std::unordered_map<std::string, std::string>`, created in `run_server` and passed by
+reference into each connection. It lives as long as the process, so keys survive a client
+disconnecting — and vanish entirely when the server stops. There is no persistence.
+
+Because the server handles one client at a time, no locking is needed. That stops being true
+the moment concurrency arrives.
+
+### Not implemented yet
+
+Every other Redis command, TTL and expiration, persistence (RDB/AOF), authentication,
+transactions, pub/sub, replication, and concurrency of any kind. A second client connecting
+while another is mid-conversation waits in the kernel's backlog.
+
+### Trying it by hand
+
+There is no `redis-cli` dependency here — RESP is simple enough to type:
+
+```bash
+# terminal 1
+./build/redis-lite-server
+
+# terminal 2
+printf '*1\r\n$4\r\nPING\r\n' | nc -w2 127.0.0.1 6379
+printf '*3\r\n$3\r\nSET\r\n$4\r\nname\r\n$8\r\nShashank\r\n' | nc -w2 127.0.0.1 6379
+printf '*2\r\n$3\r\nGET\r\n$4\r\nname\r\n' | nc -w2 127.0.0.1 6379
+printf '*2\r\n$3\r\nDEL\r\n$4\r\nname\r\n' | nc -w2 127.0.0.1 6379
+```
+
+Several commands in a single connection, to watch the buffer loop work:
+
+```bash
+printf '*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING\r\n' | nc -w2 127.0.0.1 6379
+```
+
+If you do have `redis-cli` installed, `redis-cli -p 6379 ping` also works — Redis-Lite speaks
+the same wire protocol, just far fewer commands.
+
 ## Trying the server
 
 ```bash
@@ -95,20 +200,15 @@ without consulting this code at all. Wiring the two together is a later stage.
 # Redis-Lite server listening on 127.0.0.1:6379
 
 # terminal 2
-nc localhost 6379
+nc 127.0.0.1 6379
 ```
 
-Type anything and press Enter — the server sends the same bytes straight back. Press Ctrl+D
-to disconnect, then run `nc` again to confirm the server accepts a fresh client. Ctrl+C in
-terminal 1 shuts the server down.
+The server no longer echoes: it expects RESP. See the Stage 4 section above for commands you
+can send. Ctrl+C in terminal 1 shuts the server down.
 
-A non-interactive one-liner, if you prefer:
-
-```bash
-printf 'hello' | nc -w1 localhost 6379
-```
-
-(`-w1` makes `nc` give up one second after stdin ends, so it does not hang waiting for more.
+(`-w2` makes `nc` give up two seconds after stdin ends, so it does not hang waiting for more.
+Use `127.0.0.1` rather than `localhost`: name resolution counts against that same timeout, and
+a cold resolver cache can eat the whole budget before the connection is even made.
 On the OpenBSD `nc` found on many Linux distributions, `-N` is the cleaner equivalent — it
 half-closes the socket at EOF. Apple's `nc` uses `-N` for something else entirely.)
 
@@ -149,8 +249,8 @@ and port 6380 rather than 6379 so it never collides with a real Redis.
 | 1 | TCP server: listen, accept, echo bytes back (standalone experiment) | **Done** |
 | 2 | TCP in the real server: accept clients sequentially, echo bytes | **Done** |
 | 3 | RESP protocol: parse requests, serialize replies | **Done** |
-| 4 | Core commands: `PING`, `ECHO`, `SET`, `GET`, `DEL`, `EXISTS` | Planned |
-| 5 | Key-value store: the hash table behind the commands | Planned |
+| 4 | Core commands: `PING`, `SET`, `GET`, `DEL` | **Done** |
+| 5 | More commands and richer key handling | Planned |
 | 6 | Expiration: `EXPIRE`, `TTL`, lazy and active eviction | Planned |
 | 7 | Event loop: non-blocking I/O, many concurrent clients | Planned |
 | 8 | Richer data types: lists, hashes, sets | Planned |
