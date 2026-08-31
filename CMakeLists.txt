@@ -23,7 +23,7 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 add_compile_options(-Wall -Wextra -Wpedantic)
 
 # The server.
-add_executable(redis-lite-server src/main.cpp)
+add_executable(redis-lite-server src/main.cpp src/server.cpp)
 target_include_directories(redis-lite-server PRIVATE include)
 
 # The tests. Plain executable; a non-zero exit code means failure, which is all

@@ -13,20 +13,46 @@ over abstractions that might pay off later.
 
 ## Status
 
-**Stages 0 and 1 complete. No Redis functionality exists yet.**
+**Stages 0–2 complete. No Redis functionality exists yet — the server echoes bytes.**
 
 What exists today:
 
 - A CMake build (C++17, warnings enabled) producing four executables.
-- `redis-lite-server`, which prints a startup line and exits. **It does not listen on a
-  socket.** The Stage 1 networking code is not wired into it.
+- `redis-lite-server`, which now listens on **127.0.0.1:6379**, accepts one client at a time,
+  echoes back whatever it receives, and keeps accepting new clients until Ctrl+C. It does not
+  understand a single Redis command yet.
 - `redis-lite-tests`, a plain test executable wired into CTest.
-- `tcp-echo-server` and `tcp-echo-client` in `experiments/` — a standalone exercise in the
-  TCP socket lifecycle, kept separate from the server on purpose (see below).
+- `tcp-echo-server` and `tcp-echo-client` in `experiments/` — the Stage 1 exercise, kept as-is.
 
-What does **not** exist yet: a server that actually accepts connections, concurrency of any
-kind, the RESP protocol, commands, key-value storage, TTL/expiration, and persistence. Every
-stage below marked *planned* describes intent, not shipped code.
+What does **not** exist yet: the RESP protocol, commands, key-value storage, TTL/expiration,
+persistence, and any form of concurrency. The server is **sequential**: a second client waits
+in the kernel's backlog until the first one disconnects. Every stage below marked *planned*
+describes intent, not shipped code.
+
+## Trying the server
+
+```bash
+# terminal 1
+./build/redis-lite-server
+# Redis-Lite server listening on 127.0.0.1:6379
+
+# terminal 2
+nc localhost 6379
+```
+
+Type anything and press Enter — the server sends the same bytes straight back. Press Ctrl+D
+to disconnect, then run `nc` again to confirm the server accepts a fresh client. Ctrl+C in
+terminal 1 shuts the server down.
+
+A non-interactive one-liner, if you prefer:
+
+```bash
+printf 'hello' | nc -w1 localhost 6379
+```
+
+(`-w1` makes `nc` give up one second after stdin ends, so it does not hang waiting for more.
+On the OpenBSD `nc` found on many Linux distributions, `-N` is the cleaner equivalent — it
+half-closes the socket at EOF. Apple's `nc` uses `-N` for something else entirely.)
 
 ## Stage 1 experiment: TCP echo
 
@@ -63,14 +89,15 @@ and port 6380 rather than 6379 so it never collides with a real Redis.
 | ----- | ----- | ------ |
 | 0 | Project foundation: build system, layout, test executable | **Done** |
 | 1 | TCP server: listen, accept, echo bytes back (standalone experiment) | **Done** |
-| 2 | RESP protocol: parse requests, serialize replies | Planned |
-| 3 | Core commands: `PING`, `ECHO`, `SET`, `GET`, `DEL`, `EXISTS` | Planned |
-| 4 | Key-value store: the hash table behind the commands | Planned |
-| 5 | Expiration: `EXPIRE`, `TTL`, lazy and active eviction | Planned |
-| 6 | Event loop: non-blocking I/O, many concurrent clients | Planned |
-| 7 | Richer data types: lists, hashes, sets | Planned |
-| 8 | Persistence: snapshotting, and an append-only log | Planned |
-| 9 | Benchmarks and tuning | Planned |
+| 2 | TCP in the real server: accept clients sequentially, echo bytes | **Done** |
+| 3 | RESP protocol: parse requests, serialize replies | Planned |
+| 4 | Core commands: `PING`, `ECHO`, `SET`, `GET`, `DEL`, `EXISTS` | Planned |
+| 5 | Key-value store: the hash table behind the commands | Planned |
+| 6 | Expiration: `EXPIRE`, `TTL`, lazy and active eviction | Planned |
+| 7 | Event loop: non-blocking I/O, many concurrent clients | Planned |
+| 8 | Richer data types: lists, hashes, sets | Planned |
+| 9 | Persistence: snapshotting, and an append-only log | Planned |
+| 10 | Benchmarks and tuning | Planned |
 
 Stage boundaries may shift; the table records the intended order.
 
@@ -78,7 +105,7 @@ Stage boundaries may shift; the table records the intended order.
 
 ```
 ├── CMakeLists.txt   the whole build
-├── src/             server sources
+├── src/             server sources (main.cpp, server.cpp, server.hpp)
 ├── include/         shared headers (empty until a header is needed)
 ├── tests/           test executable, run via CTest
 ├── experiments/     standalone learning exercises, not part of the server
