@@ -4,7 +4,7 @@ A Redis-inspired in-memory key-value database written from scratch in C++17.
 
 This is a learning / systems-programming project. The goal is not to replace Redis, but to
 understand — by building them — the pieces that make a server like Redis work: networking,
-protocol parsing, hash tables, expiration, and persistence. Everything is written against
+protocol parsing, an in-memory keyspace, expiration, and persistence. Everything is written against
 the standard library and the OS; third-party dependencies are avoided on purpose.
 
 Each stage introduces only the concepts that stage needs. The code is meant to stay readable
@@ -13,24 +13,287 @@ over abstractions that might pay off later.
 
 ## Status
 
-**Stages 0–9 complete. A single-threaded, event-driven server with four data types, TTL and append-only persistence.**
+**Stages 0–10 complete.** A single-threaded, event-driven key-value server with four data
+types, TTL expiration, append-only persistence, and a benchmark harness.
 
 What exists today:
 
-- A CMake build (C++17, warnings enabled) producing four executables.
+- A CMake build (C++17, warnings enabled, zero warnings) producing five executables.
 - `redis-lite-server`, which listens on **127.0.0.1:6379**, serves **many clients at once from
   a single thread** using a kqueue event loop, and executes `PING`, `SET`, `GET`, `DEL`,
   `EXPIRE` and `TTL` over RESP, plus list, hash and set commands, until Ctrl+C. Data survives a
   restart via an append-only log.
-- A RESP2 parser and serializer (`src/resp.hpp`, `src/resp.cpp`), now driving the server.
-- A command layer (`src/commands.hpp`, `src/commands.cpp`) holding the key-value store and
-  its expiration deadlines.
+- A RESP2 parser and serializer (`src/resp.hpp`, `src/resp.cpp`), driving the server.
+- A command layer (`src/commands.hpp`, `src/commands.cpp`) holding the typed keyspace and its
+  expiration deadlines, and a persistence layer (`src/persistence.hpp`, `src/persistence.cpp`).
 - `redis-lite-tests`, a plain test executable wired into CTest (462 checks).
+- `redis-lite-bench`, the benchmark client (`benchmarks/`).
 - `tcp-echo-server` and `tcp-echo-client` in `experiments/` — the Stage 1 exercise, kept as-is.
 
-What does **not** exist yet: sorted sets and the rest of the Redis command set, log compaction,
-and portability beyond macOS/BSD (see the note on `epoll` below).
-Every stage below marked *planned* describes intent, not shipped code.
+**Deliberately out of scope**, not unfinished: sorted sets and the rest of the Redis command
+set, AOF rewriting and compaction, `fsync`-level crash consistency, transactions, pub/sub,
+replication, and clustering. The project exists to build the core mechanisms, not to be a
+drop-in Redis.
+
+**A real limitation**, not a choice: the event loop uses `kqueue`, so the server is
+macOS/BSD-only. Linux would need `epoll` (see Stage 7).
+
+## What this demonstrates
+
+Each item below is implemented from scratch against the standard library and the OS — no
+third-party dependencies.
+
+| Area | What was built |
+| ---- | -------------- |
+| **Systems / networking** | POSIX sockets, the full TCP server lifecycle, non-blocking I/O, `kqueue` readiness notification, partial reads and writes |
+| **Protocol engineering** | A RESP2 parser and serializer that handles incremental input, binary-safe payloads, and malformed data without crashing |
+| **Concurrency** | One-thread-per-client with mutex-guarded shared state (Stage 6), then a single-threaded event loop that removes the need for locking (Stage 7) |
+| **Data structures** | A typed keyspace built on `std::variant`, so a key holding two types is unrepresentable rather than merely checked |
+| **Time** | Lazy TTL expiration, and the `steady_clock` vs `system_clock` distinction that matters once deadlines are written to disk |
+| **Durability** | An append-only log with length-prefixed records, replay through the live command path, and safe handling of corrupt files |
+| **Performance** | A benchmark harness, profiling, and measurement-driven optimization — including one optimization that was measured, found worthless, and reverted |
+| **Engineering practice** | 462 unit checks, mutation testing to prove the tests actually fail, and honest treatment of benchmark noise |
+
+## Architecture
+
+One thread, one event loop. The kernel reports which sockets are ready; the loop handles only
+those, so an idle client costs a buffer rather than a thread.
+
+```
+                 kqueue event loop  (single thread, src/server.cpp)
+                            |
+        +-------------------+-------------------+
+        |                                       |
+   listening socket                        client sockets
+   accept() until EAGAIN              recv() until EAGAIN
+                                              |
+                                    per-client input buffer
+                                              |
+                                    parse()   src/resp.cpp        <- RESP2 -> RespValue
+                                              |
+                                 execute_command()  src/commands.cpp
+                                     |                  |
+                              typed keyspace      append-only log
+                              (std::variant)      src/persistence.cpp
+                                     |                  |
+                                     +--------+---------+
+                                              |
+                                    serialize()  src/resp.cpp     <- RespValue -> RESP2
+                                              |
+                                    per-client output buffer
+                                              |
+                                    send(), EVFILT_WRITE if it blocks
+```
+
+A request travels: **bytes → input buffer → `parse` → `RespValue` → `execute_command` → store
+mutation (+ log record) → reply `RespValue` → `serialize` → output buffer → bytes.**
+
+Both buffers exist because TCP is a byte stream: one request may arrive across several reads,
+one read may contain several requests, and a large reply may not be writable in one call.
+
+| File | Responsibility |
+| ---- | -------------- |
+| `src/main.cpp` | Entry point; optional log-path argument |
+| `src/server.cpp` | Sockets, kqueue event loop, per-client buffers, signal handling |
+| `src/resp.cpp` | RESP2 parsing and serialization — no I/O, no knowledge of commands |
+| `src/commands.cpp` | The keyspace, command dispatch, TTL logic |
+| `src/persistence.cpp` | Append-only log writing and replay |
+
+On startup the log is replayed *before* the listening socket opens; a malformed record is fatal
+rather than silently partial.
+
+## Layout
+
+```
+├── CMakeLists.txt         the whole build
+├── src/                   server, RESP layer, commands, persistence
+├── include/               shared headers (empty; internal headers live beside their sources)
+├── tests/                 test executable, run via CTest
+├── benchmarks/            benchmark client and its runner script
+├── experiments/           standalone learning exercises, not part of the server
+├── demo_event_loop.sh     scripted demonstration of the event loop
+├── demo_persistence.sh    scripted demonstration of restart persistence
+└── demo_datatypes.sh      scripted demonstration of lists, hashes and sets
+```
+
+## Build, run, test
+
+```bash
+cmake -S . -B build
+cmake --build build
+ctest --test-dir build --output-on-failure
+./build/redis-lite-server
+```
+
+The default build is **Debug**, which on this project means `-g` with no optimisation — right
+for development and for the debugger, but see *Benchmarking* before drawing performance
+conclusions from it.
+
+Scripted demonstrations, each self-contained (they start a server, exercise it, and shut down):
+
+```bash
+./demo_event_loop.sh     # idle clients, pipelining, partial reads, large replies
+./demo_persistence.sh    # data surviving a restart, corrupt-log handling
+./demo_datatypes.sh      # lists, hashes, sets, WRONGTYPE, TTL on a collection
+```
+
+## Trying the server
+
+```bash
+# terminal 1
+./build/redis-lite-server
+# Redis-Lite server listening on 127.0.0.1:6379
+
+# terminal 2
+nc 127.0.0.1 6379
+```
+
+The server speaks RESP, not plain text, so `nc` needs the right bytes:
+
+```bash
+# SET foo bar
+printf '*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n' | nc -w2 127.0.0.1 6379
+
+# GET foo
+printf '*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n' | nc -w2 127.0.0.1 6379
+```
+
+`demo_datatypes.sh` contains a `resp()` shell function that builds these from plain arguments.
+The Stage 4 and Stage 9 design notes below list every supported command. Ctrl+C in terminal 1
+shuts the server down.
+
+(`-w2` makes `nc` give up two seconds after stdin ends, so it does not hang waiting for more.
+Use `127.0.0.1` rather than `localhost`: name resolution counts against that same timeout, and
+a cold resolver cache can eat the whole budget before the connection is even made.
+On the OpenBSD `nc` found on many Linux distributions, `-N` is the cleaner equivalent — it
+half-closes the socket at EOF. Apple's `nc` uses `-N` for something else entirely.)
+
+## Benchmarking
+
+```bash
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release
+BUILD=build-release ./benchmarks/run.sh --ops 20000 --pipeline 64
+```
+
+`benchmarks/run.sh` starts a server on a fresh log file, runs `redis-lite-bench` against it, and
+shuts it down. The client holds one persistent connection and sends real RESP, measuring each
+command twice: **sequential** (one request, wait for the reply — round-trip bound) and
+**pipelined** (many requests in flight — server-throughput bound). Commands that need existing
+data get an untimed seeding phase, so the measurement covers the operation and not its setup.
+
+**Build in Release to benchmark.** The Debug default has no optimisation at all and measures
+roughly a third of the real throughput.
+
+### Results
+
+Apple M3, loopback, 16-byte values, pipeline depth 64, 20 000 operations per command.
+
+| command | sequential ops/s | pipelined ops/s |
+| ------- | ---------------: | --------------: |
+| SET | 49,837 | 436,894 |
+| GET | 62,675 | 1,378,831 |
+| DEL | 54,269 | 485,008 |
+| LPUSH | 53,475 | 453,328 |
+| LPOP | 53,769 | 482,005 |
+| HSET | 52,689 | 422,793 |
+| HGET | 62,712 | 1,134,465 |
+| SADD | 52,034 | 447,301 |
+| SISMEMBER | 62,904 | 1,231,245 |
+
+Sequential numbers are round-trip bound — dominated by syscalls and loopback latency rather
+than by server work — so only the pipelined column is a useful optimization signal.
+
+The clearest structural result is the split between read-only commands (~1.1–1.4M/s) and
+commands that append to the log (~420–490k/s). Probing a build with the log path skipped put
+`SET` at ~1.06M/s, so **persistence costs roughly 60% of write-command throughput.**
+
+### Where the gains came from
+
+Two very different things, worth keeping separate:
+
+- **Build flags, no code change.** Moving from the Debug default (`-O0`) to Release (`-O3`)
+  was worth **2.5×–5×** on pipelined throughput. This dwarfs everything else here.
+- **Code changes, measured individually.** Removing a per-command `std::cout` log line
+  (which emitted 7.9 MB during a single benchmark run) gave **+9–12% on reads** and +1–4% on
+  writes. Rewriting the log-record formatting to avoid a per-command heap allocation and
+  locale-aware stream insertion gave a further **+5–8% on writes**. Together: roughly **+10% on
+  reads and +3–8% on writes.**
+
+A third optimization — batching the log flush instead of flushing per command — was implemented,
+measured at 1.3% (inside the noise floor), and **reverted**. The syscall was not the bottleneck,
+and the change would have coarsened durability granularity for nothing.
+
+### Measurement caveats
+
+Run-to-run variance is about **±3%** on a quiet machine and much worse under competing load, so
+differences under ~5% are noise until repeated. The table above averages two consecutive runs
+(`DEL` varied most between them, by 12%). The before/after comparisons in the previous section
+are medians of at least three alternating runs, with outliers from background load discarded.
+
+The first harness shared keys between the sequential and pipelined phases, which made repeated
+`SADD`/`DEL`/`LPOP` measure a no-op path and report inflated numbers; each phase now uses its own
+keyspace. The Debug-vs-Release figures were gathered before that fix, so the 2.5×–5× range above
+is drawn from the commands the bug did not affect.
+
+## Stages
+
+The project was built in order, each stage introducing only the concepts it needed. The
+sections after this table are the design notes written at each step.
+
+| Stage | Focus | Status |
+| ----- | ----- | ------ |
+| 0 | Project foundation: build system, layout, test executable | **Done** |
+| 1 | TCP server: listen, accept, echo bytes back (standalone experiment) | **Done** |
+| 2 | TCP in the real server: accept clients sequentially, echo bytes | **Done** |
+| 3 | RESP protocol: parse requests, serialize replies | **Done** |
+| 4 | Core commands: `PING`, `SET`, `GET`, `DEL` | **Done** |
+| 5 | Expiration: `EXPIRE`, `TTL`, lazy eviction | **Done** |
+| 6 | Concurrency: one thread per client, mutex-guarded store | **Done** |
+| 7 | Event loop: non-blocking I/O with kqueue, single-threaded | **Done** |
+| 8 | Persistence: an append-only log | **Done** |
+| 9 | Richer data types: lists, hashes, sets | **Done** |
+| 10 | Benchmarking and measurement-driven tuning | **Done** |
+
+Stages 6 and 7 are worth reading together: Stage 6 introduces threads and a mutex, and Stage 7
+removes both by making the server event-driven. The mutex was not a mistake being corrected —
+it was the correct answer to the architecture at the time.
+
+## Design notes, stage by stage
+
+These are the notes written as each stage was built, kept in order. They describe the system
+**as it stood at that point**, which is the useful part: Stage 6 argues for a mutex that
+Stage 7 then removes. Where a section says something is missing, it means missing *at that
+stage* — check the Status section above for what exists today.
+
+## Stage 1 experiment: TCP echo
+
+`experiments/` holds a two-program exercise in the plain POSIX socket API, written to
+understand the connection lifecycle before any of it goes into the real server. The server
+is blocking and single-shot: it handles exactly one client, echoes one message, and exits.
+No event loop, no threads, no non-blocking I/O.
+
+The full lifecycle it walks through: `socket` → `bind` → `listen` → `accept` → `recv` →
+`send` → `close`.
+
+Run it in two terminals, or use the one-liner below:
+
+```bash
+# terminal 1
+./build/tcp-echo-server
+
+# terminal 2
+./build/tcp-echo-client hello
+```
+
+The client is optional — netcat speaks the same (non-)protocol:
+
+```bash
+printf 'hello' | nc localhost 6380
+```
+
+It listens on **127.0.0.1:6380**: loopback only, so nothing off this machine can reach it,
+and port 6380 rather than 6379 so it never collides with a real Redis.
 
 ## Stage 3: the RESP protocol
 
@@ -82,7 +345,7 @@ read 2:  $4\r\nname\r\n           -> Ok, once appended to the buffer
 
 — is handled without the parser ever seeing it as broken.
 
-### Not implemented yet
+### Not implemented at this stage
 
 Nothing executes commands. Parsing `GET name` produces an array of two bulk strings and stops
 there; there is no key-value store, no dispatch, and the TCP server still echoes raw bytes
@@ -164,7 +427,7 @@ disconnecting — and vanish entirely when the server stops. There is no persist
 Because the server handles one client at a time, no locking is needed. That stops being true
 the moment concurrency arrives.
 
-### Not implemented yet
+### Not implemented at this stage
 
 Every other Redis command, TTL and expiration, persistence (RDB/AOF), authentication,
 transactions, pub/sub, replication, and concurrency of any kind. A second client connecting
@@ -847,114 +1110,3 @@ tests must compare members as a set, which they do.
   collection produces a very large output buffer.
 - **The log still grows forever** — a list that is pushed and popped a million times keeps all
   two million records. Compaction remains the future improvement it was in Stage 8.
-
-## Benchmarking
-
-```bash
-cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
-cmake --build build-release
-BUILD=build-release ./benchmarks/run.sh --ops 20000 --pipeline 64
-```
-
-`benchmarks/run.sh` starts a server on a fresh log file, runs `redis-lite-bench` against it, and
-shuts it down. The client holds one persistent connection and sends real RESP, measuring each
-command twice: **sequential** (one request, wait for the reply — round-trip bound) and
-**pipelined** (many requests in flight — server-throughput bound).
-
-**Build in Release to benchmark.** The default build is Debug, which on this project means `-g`
-with no optimisation at all; it measures roughly a third of the real throughput.
-
-Numbers move by a few percent between runs, so treat differences under ~5% as noise and repeat
-the run before believing them.
-
-## Trying the server
-
-```bash
-# terminal 1
-./build/redis-lite-server
-# Redis-Lite server listening on 127.0.0.1:6379
-
-# terminal 2
-nc 127.0.0.1 6379
-```
-
-The server no longer echoes: it expects RESP. See the Stage 4 section above for commands you
-can send. Ctrl+C in terminal 1 shuts the server down.
-
-(`-w2` makes `nc` give up two seconds after stdin ends, so it does not hang waiting for more.
-Use `127.0.0.1` rather than `localhost`: name resolution counts against that same timeout, and
-a cold resolver cache can eat the whole budget before the connection is even made.
-On the OpenBSD `nc` found on many Linux distributions, `-N` is the cleaner equivalent — it
-half-closes the socket at EOF. Apple's `nc` uses `-N` for something else entirely.)
-
-## Stage 1 experiment: TCP echo
-
-`experiments/` holds a two-program exercise in the plain POSIX socket API, written to
-understand the connection lifecycle before any of it goes into the real server. The server
-is blocking and single-shot: it handles exactly one client, echoes one message, and exits.
-No event loop, no threads, no non-blocking I/O.
-
-The full lifecycle it walks through: `socket` → `bind` → `listen` → `accept` → `recv` →
-`send` → `close`.
-
-Run it in two terminals, or use the one-liner below:
-
-```bash
-# terminal 1
-./build/tcp-echo-server
-
-# terminal 2
-./build/tcp-echo-client hello
-```
-
-The client is optional — netcat speaks the same (non-)protocol:
-
-```bash
-printf 'hello' | nc localhost 6380
-```
-
-It listens on **127.0.0.1:6380**: loopback only, so nothing off this machine can reach it,
-and port 6380 rather than 6379 so it never collides with a real Redis.
-
-## Planned stages
-
-| Stage | Focus | Status |
-| ----- | ----- | ------ |
-| 0 | Project foundation: build system, layout, test executable | **Done** |
-| 1 | TCP server: listen, accept, echo bytes back (standalone experiment) | **Done** |
-| 2 | TCP in the real server: accept clients sequentially, echo bytes | **Done** |
-| 3 | RESP protocol: parse requests, serialize replies | **Done** |
-| 4 | Core commands: `PING`, `SET`, `GET`, `DEL` | **Done** |
-| 5 | Expiration: `EXPIRE`, `TTL`, lazy eviction | **Done** |
-| 6 | Concurrency: one thread per client, mutex-guarded store | **Done** |
-| 7 | Event loop: non-blocking I/O with kqueue, single-threaded | **Done** |
-| 8 | Persistence: an append-only log | **Done** |
-| 9 | Richer data types: lists, hashes, sets | **Done** |
-| 10 | Benchmarks and tuning | Planned |
-
-Stage boundaries may shift; the table records the intended order.
-
-## Layout
-
-```
-├── CMakeLists.txt   the whole build
-├── src/             server sources and the RESP protocol layer
-├── include/         shared headers (empty until a header is needed)
-├── tests/           test executable, run via CTest
-├── experiments/     standalone learning exercises, not part of the server
-├── demo_event_loop.sh   scripted demonstration of the event loop
-├── demo_persistence.sh  scripted demonstration of restart persistence
-├── demo_datatypes.sh    scripted demonstration of lists, hashes and sets
-└── benchmarks/      reserved for a later stage; empty
-```
-
-## Build, run, test
-
-```bash
-cmake -S . -B build
-cmake --build build
-./build/redis-lite-server
-ctest --test-dir build --output-on-failure
-```
-
-The Stage 1 experiment builds alongside the rest; see the section above for running it.
