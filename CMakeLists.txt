@@ -47,6 +47,13 @@ target_include_directories(redis-lite-tests PRIVATE include src)
 target_link_libraries(redis-lite-tests PRIVATE Threads::Threads)
 add_test(NAME redis-lite-tests COMMAND redis-lite-tests)
 
+# Benchmark client. Links the project's own RESP parser so it frames replies
+# exactly the way the server does.
+add_executable(redis-lite-bench
+    benchmarks/bench.cpp
+    src/resp.cpp)
+target_include_directories(redis-lite-bench PRIVATE src)
+
 # Stage 1 experiments: standalone TCP programs for learning the socket API.
 # Deliberately not linked into the server above, and they use no project
 # headers -- they are self-contained experiments.

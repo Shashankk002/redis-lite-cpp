@@ -220,10 +220,6 @@ namespace redis_lite {
                     return AfterRead::CloseNow;  // out of sync; close, as Redis does
                 }
 
-                if (!result.value.elements.empty()) {
-                    std::cout << ("command: " + result.value.elements[0].string + "\n");
-                }
-
                 // Single-threaded again, so the store needs no lock. State-changing
                 // commands append themselves to the log before the reply goes out.
                 const RespValue reply = execute_command(result.value, store, &log);

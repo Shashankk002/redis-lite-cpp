@@ -2,8 +2,9 @@
 #define REDIS_LITE_PERSISTENCE_HPP
 
 #include <fstream>
+#include <initializer_list>
 #include <string>
-#include <vector>
+#include <string_view>
 
 #include "commands.hpp"
 
@@ -12,8 +13,8 @@ namespace redis_lite {
     bool open_log(const std::string& path, std::ofstream& log);
 
     void log_command(std::ofstream* log,
-                     const std::string& verb,
-                     const std::vector<std::string>& arguments);
+                     std::string_view verb,
+                     std::initializer_list<std::string_view> arguments);
 
 
     void log_expire(std::ofstream* log, const std::string& key, long long seconds_from_now);

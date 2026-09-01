@@ -1,5 +1,6 @@
 #include "persistence.hpp"
 
+#include <charconv>
 #include <chrono>
 #include <istream>
 
@@ -39,6 +40,18 @@ namespace redis_lite {
         long long unix_now() {
             const auto now = std::chrono::system_clock::now().time_since_epoch();
             return std::chrono::duration_cast<std::chrono::seconds>(now).count();
+        }
+
+        void append_number(std::string& record, long long number) {
+            char digits[24];
+            const auto end = std::to_chars(digits, digits + sizeof(digits), number).ptr;
+            record.append(digits, static_cast<std::size_t>(end - digits));
+        }
+
+        void append_field(std::string& record, std::string_view text) {
+            append_number(record, static_cast<long long>(text.size()));
+            record += ' ';
+            record.append(text);
         }
 
         void write_field(std::ofstream& log, const std::string& text) {
@@ -82,19 +95,22 @@ namespace redis_lite {
     }
 
     void log_command(std::ofstream* log,
-                     const std::string& verb,
-                     const std::vector<std::string>& arguments) {
+                     std::string_view verb,
+                     std::initializer_list<std::string_view> arguments) {
         if (log == nullptr) {
             return;  // replaying: the record is already in the file
         }
 
-        *log << verb;
-        for (const std::string& argument : arguments) {
-            *log << ' ';
-            write_field(*log, argument);
+        // One buffer and one write: measurably cheaper than a chain of stream
+        // insertions, which pay for locale-aware formatting each time.
+        std::string record(verb);
+        for (std::string_view argument : arguments) {
+            record += ' ';
+            append_field(record, argument);
         }
-        *log << '\n';
+        record += '\n';
 
+        log->write(record.data(), static_cast<std::streamsize>(record.size()));
         log->flush();
     }
 

@@ -848,6 +848,25 @@ tests must compare members as a set, which they do.
 - **The log still grows forever** — a list that is pushed and popped a million times keeps all
   two million records. Compaction remains the future improvement it was in Stage 8.
 
+## Benchmarking
+
+```bash
+cmake -S . -B build-release -DCMAKE_BUILD_TYPE=Release
+cmake --build build-release
+BUILD=build-release ./benchmarks/run.sh --ops 20000 --pipeline 64
+```
+
+`benchmarks/run.sh` starts a server on a fresh log file, runs `redis-lite-bench` against it, and
+shuts it down. The client holds one persistent connection and sends real RESP, measuring each
+command twice: **sequential** (one request, wait for the reply — round-trip bound) and
+**pipelined** (many requests in flight — server-throughput bound).
+
+**Build in Release to benchmark.** The default build is Debug, which on this project means `-g`
+with no optimisation at all; it measures roughly a third of the real throughput.
+
+Numbers move by a few percent between runs, so treat differences under ~5% as noise and repeat
+the run before believing them.
+
 ## Trying the server
 
 ```bash
