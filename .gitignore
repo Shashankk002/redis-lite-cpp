@@ -31,3 +31,6 @@ _deps/
 
 # macOS
 .DS_Store
+
+# Persistence log written at runtime
+*.aof

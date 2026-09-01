@@ -13,21 +13,21 @@ over abstractions that might pay off later.
 
 ## Status
 
-**Stages 0–7 complete. A single-threaded, event-driven server speaking Redis for a six-command subset, with TTL.**
+**Stages 0–8 complete. A single-threaded, event-driven server with TTL and append-only persistence.**
 
 What exists today:
 
 - A CMake build (C++17, warnings enabled) producing four executables.
 - `redis-lite-server`, which listens on **127.0.0.1:6379**, serves **many clients at once from
   a single thread** using a kqueue event loop, and executes `PING`, `SET`, `GET`, `DEL`,
-  `EXPIRE` and `TTL` over RESP until Ctrl+C.
+  `EXPIRE` and `TTL` over RESP until Ctrl+C. Data survives a restart via an append-only log.
 - A RESP2 parser and serializer (`src/resp.hpp`, `src/resp.cpp`), now driving the server.
 - A command layer (`src/commands.hpp`, `src/commands.cpp`) holding the key-value store and
   its expiration deadlines.
-- `redis-lite-tests`, a plain test executable wired into CTest (218 checks).
+- `redis-lite-tests`, a plain test executable wired into CTest (283 checks).
 - `tcp-echo-server` and `tcp-echo-client` in `experiments/` — the Stage 1 exercise, kept as-is.
 
-What does **not** exist yet: every other Redis command, persistence, and portability beyond
+What does **not** exist yet: every other Redis command, log compaction, and portability beyond
 macOS/BSD (see the note on `epoll` below).
 Every stage below marked *planned* describes intent, not shipped code.
 
@@ -545,6 +545,152 @@ Shows an idle client not blocking others, shared state between clients, simultan
 pipelining, a request split across two writes, a 200 KB reply that needs several writes,
 malformed input surviving, reconnection, and TTL.
 
+## Stage 8: persistence with an append-only log
+
+### Why the data vanished before
+
+Everything lived in `std::unordered_map`s inside the process. When the process exits — Ctrl+C,
+a crash, a reboot — that memory is returned to the OS and every key is gone. Nothing had ever
+been written to disk.
+
+### What an append-only log is
+
+The simplest durable design is not to save the *data*, but to save the *changes*. Every command
+that modifies state is appended to a file, in order. To rebuild the store you replay them:
+
+```
+SET 3 foo 3 bar          ->  foo = "bar"
+SET 5 count 2 42         ->  count = "42"
+DEL 3 foo                ->  foo removed
+EXPIRE 5 count 1772456789    ->  count expires at that Unix second
+```
+
+Appending is cheap (no seeking, no rewriting), and the file is a complete history. This is the
+same idea as Redis's AOF, though the format here is our own and deliberately simpler.
+
+### The record format
+
+```
+SET    <keylen> <key> <valuelen> <value>\n
+DEL    <keylen> <key>\n
+EXPIRE <keylen> <key> <unix-deadline-seconds>\n
+```
+
+Keys and values are **length-prefixed**, and that is the important part. Redis values are
+binary-safe: they may contain spaces, newlines, even NUL bytes. A delimiter-based format would
+break on all of those. Because the reader is told to take exactly *N* bytes, any byte sequence
+survives the round trip — `SET 5 a key 7 a value` is unambiguous, and so is a value that happens
+to contain `\n` or looks like a record itself.
+
+The file stays readable in a text editor for ordinary keys, which makes it easy to inspect.
+
+### Which commands are recorded, and which are not
+
+Recorded: **`SET`**, **`DEL`**, **`EXPIRE`** — the commands that change state.
+
+Not recorded: **`GET`**, **`TTL`**, **`PING`** — they only read. Replaying a `GET` would
+accomplish nothing, and logging reads would make the file grow without adding information.
+
+Two policy details:
+
+- **`DEL` is recorded only when it actually removed something.** A `DEL` on a missing key
+  changes nothing, so there is nothing to reconstruct.
+- **`EXPIRE key 0`** (or a negative time) deletes the key, so it is recorded as a `DEL` — the
+  record describes the effect, not the command that was typed.
+
+### Why `steady_clock` cannot be persisted
+
+Stage 5 chose `steady_clock` for expirations because it is monotonic: it cannot jump when the
+wall clock is corrected. But its zero point is arbitrary — usually when the machine booted — and
+it means nothing in another process. Writing `steady_clock::time_point{4213377}` to disk and
+reading it back tomorrow would produce a deadline in the far past or far future at random.
+
+So the log stores an **absolute Unix timestamp** from `system_clock`, which has a fixed,
+universally agreed zero point. On replay the server subtracts the current wall-clock time to get
+the remaining seconds, and hands *that duration* to the ordinary `EXPIRE` path, which converts it
+back into a `steady_clock` deadline:
+
+```
+on write:   deadline_unix = now_unix + seconds
+on replay:  remaining = deadline_unix - now_unix
+            remaining <= 0  ->  the key died while we were down: delete it
+            remaining >  0  ->  EXPIRE key remaining
+```
+
+The in-memory logic is untouched: it still uses `steady_clock`, which is still the right choice
+for measuring an interval inside one process. Only the on-disk representation is wall-clock.
+
+### Replay must not write back into the log
+
+Replay runs each record through the same `execute_command()` a network client would reach — which
+is what guarantees the semantics match exactly, including "`SET` clears an existing TTL" and
+"`DEL` removes the expiration too". But those commands would normally *append to the log*, so
+replaying a 10-record file would write 10 more records, and the next start would write 20.
+
+The mechanism that prevents it is deliberately tiny: `execute_command` takes a `std::ofstream*`,
+and replay passes `nullptr`.
+
+```cpp
+RespValue execute_command(const RespValue& request, Store& store, std::ofstream* log = nullptr);
+```
+
+A null log records nothing. No flags, no modes, no persistence class.
+
+### flush vs fsync
+
+After each record the server calls `log.flush()`. That empties **the C++ stream's own buffer**
+into the operating system. It is *not* `fsync()`, which asks the OS to push its page cache down
+to the physical device.
+
+So: if the **process** dies (crash, `kill -9`), the flushed records are safe, because the OS has
+them. If the **machine** loses power, recently written records may still be lost, because they
+may not have reached the disk yet. Real Redis exposes this as a choice (`appendfsync
+always/everysec/no`) precisely because `fsync` on every write is slow. This is a learning
+implementation, not a crash-consistent database, and it stops at `flush`.
+
+### The file grows forever
+
+This log is append-only with no compaction, so
+
+```
+SET foo bar
+SET foo baz
+SET foo qux
+```
+
+leaves all three records even though only the last matters. A long-running server's log grows
+without bound, and startup gets slower as it grows. Real Redis solves this with **AOF rewrite**:
+periodically writing a fresh, minimal log describing the current state. That is a future
+improvement and is not implemented here.
+
+### Other limitations
+
+- **No compaction, rewriting, snapshots or rotation** — see above.
+- **`flush`, not `fsync`** — see above.
+- **A corrupt log is fatal.** If any record is malformed, the server prints the record number and
+  the reason and refuses to start, rather than loading part of the data and pretending it is
+  complete. Recovery is manual: fix or remove the file. There is no truncate-and-continue mode.
+- **Writes are synchronous.** The append happens inline in the event loop, so a slow disk stalls
+  every client. Asynchronous disk I/O is out of scope.
+- **Lazy expiration means expired keys stay in the log.** A key that expired is dropped at replay
+  time, but its records remain in the file until a compaction that does not exist yet.
+
+### Trying it
+
+```bash
+./demo_persistence.sh
+```
+
+Or by hand — the log path is an optional argument, defaulting to `redis-lite.aof` in the working
+directory:
+
+```bash
+./build/redis-lite-server /tmp/my.aof
+# ... SET some keys, then Ctrl+C ...
+cat /tmp/my.aof
+./build/redis-lite-server /tmp/my.aof     # the keys are back
+```
+
 ## Trying the server
 
 ```bash
@@ -606,8 +752,8 @@ and port 6380 rather than 6379 so it never collides with a real Redis.
 | 5 | Expiration: `EXPIRE`, `TTL`, lazy eviction | **Done** |
 | 6 | Concurrency: one thread per client, mutex-guarded store | **Done** |
 | 7 | Event loop: non-blocking I/O with kqueue, single-threaded | **Done** |
-| 8 | Richer data types: lists, hashes, sets | Planned |
-| 9 | Persistence: snapshotting, and an append-only log | Planned |
+| 8 | Persistence: an append-only log | **Done** |
+| 9 | Richer data types: lists, hashes, sets | Planned |
 | 10 | Benchmarks and tuning | Planned |
 
 Stage boundaries may shift; the table records the intended order.
@@ -621,6 +767,7 @@ Stage boundaries may shift; the table records the intended order.
 ├── tests/           test executable, run via CTest
 ├── experiments/     standalone learning exercises, not part of the server
 ├── demo_event_loop.sh   scripted demonstration of the event loop
+├── demo_persistence.sh  scripted demonstration of restart persistence
 └── benchmarks/      reserved for a later stage; empty
 ```
 

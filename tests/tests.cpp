@@ -1,13 +1,19 @@
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <ctime>
+#include <fstream>
 #include <iostream>
 #include <mutex>
+#include <sstream>
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "commands.hpp"
+#include "persistence.hpp"
 #include "resp.hpp"
 
 using redis_lite::ParseResult;
@@ -941,6 +947,333 @@ static void test_client_state_is_per_fd() {
     check_equal(output[4], "$-1\r\n", "the first client's request completed correctly");
 }
 
+// ---------------------------------------------------------------------------
+// Stage 8: the append-only log.
+//
+// Every test uses its own temporary file and removes it afterwards, so none of
+// them touch the real redis-lite.aof.
+// ---------------------------------------------------------------------------
+
+static const char* const kLogPath = "test-redis-lite.aof";
+
+static void remove_log() {
+    std::remove(kLogPath);
+}
+
+static std::string read_log() {
+    std::ifstream in(kLogPath, std::ios::in | std::ios::binary);
+    std::ostringstream contents;
+    contents << in.rdbuf();
+    return contents.str();
+}
+
+static void write_log(const std::string& contents) {
+    std::ofstream out(kLogPath, std::ios::out | std::ios::binary | std::ios::trunc);
+    out << contents;
+}
+
+// Runs one command against `store`, recording it in `log` the way the server does.
+static std::string run_logged(Store& store,
+                              std::ofstream& log,
+                              const std::vector<std::string>& args) {
+    std::vector<RespValue> elements;
+    for (const std::string& arg : args) {
+        elements.push_back(redis_lite::make_bulk_string(arg));
+    }
+    return serialize(execute_command(redis_lite::make_array(elements), store, &log));
+}
+
+static void test_log_records_writes() {
+    std::cout << "\n-- persistence: what gets written --\n";
+
+    remove_log();
+    Store store;
+    std::ofstream log;
+    check(redis_lite::open_log(kLogPath, log), "the log file opens");
+
+    run_logged(store, log, {"SET", "foo", "bar"});
+    check_equal(read_log(), "SET 3 foo 3 bar\n", "SET is recorded, length-prefixed");
+
+    run_logged(store, log, {"DEL", "foo"});
+    check_equal(read_log(), "SET 3 foo 3 bar\nDEL 3 foo\n", "DEL is recorded");
+
+    // A DEL that removed nothing changed no state, so nothing is recorded.
+    const std::string before_noop = read_log();
+    run_logged(store, log, {"DEL", "nosuchkey"});
+    check_equal(read_log(), before_noop, "a DEL that deleted nothing is not recorded");
+
+    remove_log();
+}
+
+static void test_log_records_expire() {
+    std::cout << "\n-- persistence: EXPIRE is stored as a wall-clock deadline --\n";
+
+    remove_log();
+    Store store;
+    std::ofstream log;
+    redis_lite::open_log(kLogPath, log);
+
+    run_logged(store, log, {"SET", "foo", "bar"});
+    run_logged(store, log, {"EXPIRE", "foo", "50"});
+
+    const std::string contents = read_log();
+    check(contents.rfind("SET 3 foo 3 bar\nEXPIRE 3 foo ", 0) == 0,
+          "EXPIRE is recorded after the SET");
+
+    // The recorded deadline should be roughly 50 seconds from now, in Unix time.
+    const std::size_t space = contents.rfind(' ');
+    const long long deadline = std::stoll(contents.substr(space + 1));
+    const long long now = static_cast<long long>(std::time(nullptr));
+    check(deadline >= now + 48 && deadline <= now + 52,
+          "the deadline is an absolute Unix timestamp about 50s away");
+
+    // EXPIRE with a non-positive time deletes the key, and records that.
+    run_logged(store, log, {"SET", "gone", "value"});
+    run_logged(store, log, {"EXPIRE", "gone", "0"});
+    const std::string after = read_log();
+    check(after.find("DEL 4 gone\n") != std::string::npos,
+          "EXPIRE 0 is recorded as a deletion");
+
+    remove_log();
+}
+
+static void test_reads_are_not_logged() {
+    std::cout << "\n-- persistence: read-only commands are not recorded --\n";
+
+    remove_log();
+    Store store;
+    std::ofstream log;
+    redis_lite::open_log(kLogPath, log);
+
+    run_logged(store, log, {"SET", "foo", "bar"});
+    const std::string after_set = read_log();
+
+    run_logged(store, log, {"GET", "foo"});
+    check_equal(read_log(), after_set, "GET is not recorded");
+
+    run_logged(store, log, {"TTL", "foo"});
+    check_equal(read_log(), after_set, "TTL is not recorded");
+
+    run_logged(store, log, {"PING"});
+    check_equal(read_log(), after_set, "PING is not recorded");
+
+    run_logged(store, log, {"GET", "missing"});
+    check_equal(read_log(), after_set, "a GET on a missing key is not recorded");
+
+    remove_log();
+}
+
+static void test_replay_rebuilds_the_store() {
+    std::cout << "\n-- persistence: replay rebuilds the store --\n";
+
+    remove_log();
+    {
+        Store store;
+        std::ofstream log;
+        redis_lite::open_log(kLogPath, log);
+        run_logged(store, log, {"SET", "name", "Shashank"});
+        run_logged(store, log, {"SET", "city", "Hyderabad"});
+        run_logged(store, log, {"SET", "gone", "value"});
+        run_logged(store, log, {"DEL", "gone"});
+        run_logged(store, log, {"EXPIRE", "city", "300"});
+    }
+
+    Store restored;
+    std::string error;
+    check(redis_lite::replay_log(kLogPath, restored, error), "the log replays without error");
+    check_equal(error, "", "no error message is produced");
+
+    check_equal(run(restored, {"GET", "name"}), "$8\r\nShashank\r\n", "a SET value is restored");
+    check_equal(run(restored, {"GET", "gone"}), "$-1\r\n", "a deleted key stays deleted");
+    check_equal(run(restored, {"GET", "city"}), "$9\r\nHyderabad\r\n", "an expiring key is restored");
+    check_equal(run(restored, {"TTL", "name"}), ":-1\r\n", "a key with no TTL reports -1");
+
+    const std::string ttl = run(restored, {"TTL", "city"});
+    check(ttl == ":300\r\n" || ttl == ":299\r\n", "the restored TTL is close to the original");
+
+    remove_log();
+}
+
+static void test_replay_does_not_append() {
+    std::cout << "\n-- persistence: replay does not write back into the log --\n";
+
+    remove_log();
+    {
+        Store store;
+        std::ofstream log;
+        redis_lite::open_log(kLogPath, log);
+        run_logged(store, log, {"SET", "foo", "bar"});
+        run_logged(store, log, {"EXPIRE", "foo", "300"});
+        run_logged(store, log, {"SET", "other", "value"});
+    }
+
+    const std::string before = read_log();
+
+    Store first;
+    std::string error;
+    redis_lite::replay_log(kLogPath, first, error);
+    check_equal(read_log(), before, "one replay leaves the file byte-for-byte identical");
+
+    // Replaying repeatedly must not grow the file either.
+    for (int i = 0; i < 5; ++i) {
+        Store again;
+        redis_lite::replay_log(kLogPath, again, error);
+    }
+    check_equal(read_log(), before, "five more replays still leave it unchanged");
+
+    remove_log();
+}
+
+static void test_replay_ordering_and_ttl_rules() {
+    std::cout << "\n-- persistence: ordering, and SET clearing an old TTL --\n";
+
+    remove_log();
+    {
+        Store store;
+        std::ofstream log;
+        redis_lite::open_log(kLogPath, log);
+
+        // Later writes must win.
+        run_logged(store, log, {"SET", "counter", "1"});
+        run_logged(store, log, {"SET", "counter", "2"});
+        run_logged(store, log, {"SET", "counter", "3"});
+
+        // SET after EXPIRE must clear the expiration.
+        run_logged(store, log, {"SET", "foo", "bar"});
+        run_logged(store, log, {"EXPIRE", "foo", "300"});
+        run_logged(store, log, {"SET", "foo", "new"});
+
+        // DEL after EXPIRE must leave nothing behind.
+        run_logged(store, log, {"SET", "temp", "value"});
+        run_logged(store, log, {"EXPIRE", "temp", "300"});
+        run_logged(store, log, {"DEL", "temp"});
+    }
+
+    Store restored;
+    std::string error;
+    check(redis_lite::replay_log(kLogPath, restored, error), "the log replays");
+
+    check_equal(run(restored, {"GET", "counter"}), "$1\r\n3\r\n", "the last SET wins");
+    check_equal(run(restored, {"GET", "foo"}), "$3\r\nnew\r\n", "the rewritten value is restored");
+    check_equal(run(restored, {"TTL", "foo"}), ":-1\r\n", "SET cleared the old TTL across a restart");
+    check_equal(run(restored, {"GET", "temp"}), "$-1\r\n", "the deleted key is gone");
+    check_equal(run(restored, {"TTL", "temp"}), ":-2\r\n", "no stale expiration is left behind");
+
+    // A stale deadline must not follow a key that is later recreated.
+    check_equal(run(restored, {"SET", "temp", "fresh"}), "+OK\r\n", "the key can be recreated");
+    check_equal(run(restored, {"TTL", "temp"}), ":-1\r\n", "the recreated key has no TTL");
+
+    remove_log();
+}
+
+static void test_replay_drops_expired_keys() {
+    std::cout << "\n-- persistence: a key whose deadline passed while down --\n";
+
+    // Written by hand so the test is deterministic: no sleeping required.
+    const long long now = static_cast<long long>(std::time(nullptr));
+    write_log("SET 5 alive 1 a\n"
+              "EXPIRE 5 alive " + std::to_string(now + 3600) + "\n"
+              "SET 4 dead 1 d\n"
+              "EXPIRE 4 dead " + std::to_string(now - 60) + "\n");
+
+    Store restored;
+    std::string error;
+    check(redis_lite::replay_log(kLogPath, restored, error), "the log replays");
+
+    check_equal(run(restored, {"GET", "alive"}), "$1\r\na\r\n", "a key still inside its deadline survives");
+    check_equal(run(restored, {"GET", "dead"}), "$-1\r\n", "a key past its deadline is gone");
+    check_equal(run(restored, {"TTL", "dead"}), ":-2\r\n", "the expired key reports -2");
+    check(restored.values.count("dead") == 0, "the expired key is not in the store at all");
+
+    remove_log();
+}
+
+static void test_missing_and_empty_logs() {
+    std::cout << "\n-- persistence: missing and empty log files --\n";
+
+    remove_log();
+    Store missing;
+    std::string error;
+    check(redis_lite::replay_log(kLogPath, missing, error), "a missing log file is not an error");
+    check(missing.values.empty(), "a missing log gives an empty store");
+    check_equal(error, "", "no error message for a missing file");
+
+    write_log("");
+    Store empty;
+    check(redis_lite::replay_log(kLogPath, empty, error), "an empty log file is not an error");
+    check(empty.values.empty(), "an empty log gives an empty store");
+
+    remove_log();
+}
+
+static void test_malformed_log_is_refused() {
+    std::cout << "\n-- persistence: malformed data is refused, not half-applied --\n";
+
+    const std::vector<std::pair<std::string, std::string>> broken = {
+        {"NONSENSE 3 foo\n",                 "an unknown record type"},
+        {"SET 3 foo\n",                      "a SET missing its value"},
+        {"SET 99 foo 3 bar\n",               "a length longer than the data"},
+        {"SET 3 foo 3 bar",                   "a record with no trailing newline"},
+        {"SET x foo 3 bar\n",                "a non-numeric length"},
+        {"EXPIRE 3 foo notanumber\n",        "a non-numeric deadline"},
+        {"SET 3 foo 3 bar\nDEL\n",           "a truncated second record"},
+    };
+
+    for (const auto& entry : broken) {
+        write_log(entry.first);
+
+        // Pre-populate, to prove a failed replay leaves the store untouched.
+        Store store;
+        run(store, {"SET", "existing", "value"});
+
+        std::string error;
+        const bool ok = redis_lite::replay_log(kLogPath, store, error);
+
+        check(!ok, std::string("replay refuses ") + entry.second);
+        check(!error.empty(), std::string("an error is reported for ") + entry.second);
+        check_equal(run(store, {"GET", "existing"}), "$5\r\nvalue\r\n",
+                    std::string("the store is untouched after ") + entry.second);
+    }
+
+    remove_log();
+}
+
+static void test_binary_safe_keys_and_values() {
+    std::cout << "\n-- persistence: awkward keys and values survive --\n";
+
+    const std::string spaced_key = "key with spaces";
+    const std::string newline_value = "line one\nline two\r\nline three";
+    const std::string empty_value;
+    const std::string numeric_looking = "42 7";
+
+    remove_log();
+    {
+        Store store;
+        std::ofstream log;
+        redis_lite::open_log(kLogPath, log);
+        run_logged(store, log, {"SET", spaced_key, newline_value});
+        run_logged(store, log, {"SET", "empty", empty_value});
+        run_logged(store, log, {"SET", "tricky", numeric_looking});
+        run_logged(store, log, {"SET", "SET 3 foo", "looks like a record"});
+    }
+
+    Store restored;
+    std::string error;
+    check(redis_lite::replay_log(kLogPath, restored, error), "the log replays");
+    check_equal(error, "", "no error for awkward data");
+
+    check_equal(restored.values[spaced_key], newline_value,
+                "a key with spaces and a value with newlines round-trip");
+    check(restored.values.count("empty") == 1 && restored.values["empty"].empty(),
+          "an empty value round-trips");
+    check_equal(restored.values["tricky"], numeric_looking,
+                "a value that looks like a length prefix round-trips");
+    check_equal(restored.values["SET 3 foo"], "looks like a record",
+                "a key that looks like a whole record round-trips");
+
+    remove_log();
+}
+
 int main() {
     std::cout << "running tests\n";
 
@@ -982,6 +1315,16 @@ int main() {
     test_input_buffer_mixed();
     test_output_buffer_partial_writes();
     test_client_state_is_per_fd();
+    test_log_records_writes();
+    test_log_records_expire();
+    test_reads_are_not_logged();
+    test_replay_rebuilds_the_store();
+    test_replay_does_not_append();
+    test_replay_ordering_and_ttl_rules();
+    test_replay_drops_expired_keys();
+    test_missing_and_empty_logs();
+    test_malformed_log_is_refused();
+    test_binary_safe_keys_and_values();
 
     std::cout << "\n";
     if (failures == 0) {

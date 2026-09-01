@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "commands.hpp"
+#include "persistence.hpp"
 #include "resp.hpp"
 
 namespace redis_lite {
@@ -169,6 +170,7 @@ namespace redis_lite {
         AfterRead handle_readable(int kq,
                                   int fd,
                                   Store& store,
+                                  std::ofstream& log,
                                   ClientBuffers& input,
                                   ClientBuffers& output) {
             char chunk[4096];
@@ -222,8 +224,9 @@ namespace redis_lite {
                     std::cout << ("command: " + result.value.elements[0].string + "\n");
                 }
 
-                // Single-threaded again, so the store needs no lock.
-                const RespValue reply = execute_command(result.value, store);
+                // Single-threaded again, so the store needs no lock. State-changing
+                // commands append themselves to the log before the reply goes out.
+                const RespValue reply = execute_command(result.value, store, &log);
                 output[fd] += serialize(reply);
 
                 buffer.erase(0, result.consumed);
@@ -237,8 +240,26 @@ namespace redis_lite {
 
     }  // namespace
 
-    int run_server(uint16_t port) {
+    int run_server(uint16_t port, const std::string& log_path) {
         install_signal_handlers();
+
+        // Rebuild the store from the log before accepting anyone. A malformed
+        // file is fatal: starting with partial data would quietly lose keys.
+        Store store;
+        std::string replay_error;
+        if (!replay_log(log_path, store, replay_error)) {
+            std::cerr << "cannot start: " << replay_error << "\n";
+            std::cerr << "fix or remove " << log_path << " and try again\n";
+            return 1;
+        }
+        std::cout << "loaded " << store.values.size() << " key(s) from " << log_path
+                  << std::endl;  // endl flushes: a startup line is useless if unseen
+
+        std::ofstream log;
+        if (!open_log(log_path, log)) {
+            std::cerr << "cannot open " << log_path << " for appending\n";
+            return 1;
+        }
 
         int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
         if (listen_fd < 0) {
@@ -291,7 +312,6 @@ namespace redis_lite {
             return 1;
         }
 
-        Store store;
         ClientBuffers client_input;   // fd -> bytes received, not yet parsed
         ClientBuffers client_output;  // fd -> bytes owed to the client
 
@@ -300,7 +320,7 @@ namespace redis_lite {
         std::unordered_set<int> closing;
 
         std::cout << "Redis-Lite server listening on 127.0.0.1:" << port
-                  << " (kqueue event loop)\n";
+                  << " (kqueue event loop)" << std::endl;
 
         std::vector<struct kevent> events(64);
 
@@ -341,7 +361,7 @@ namespace redis_lite {
 
                 if (event.filter == EVFILT_READ) {
                     const AfterRead outcome =
-                        handle_readable(kq, fd, store, client_input, client_output);
+                        handle_readable(kq, fd, store, log, client_input, client_output);
 
                     if (outcome == AfterRead::CloseNow) {
                         close_client(kq, fd, client_input, client_output, closing);

@@ -31,7 +31,8 @@ add_executable(redis-lite-server
     src/main.cpp
     src/server.cpp
     src/resp.cpp
-    src/commands.cpp)
+    src/commands.cpp
+    src/persistence.cpp)
 target_include_directories(redis-lite-server PRIVATE include)
 
 # The tests. Plain executable; a non-zero exit code means failure, which is all
@@ -40,7 +41,8 @@ enable_testing()
 add_executable(redis-lite-tests
     tests/tests.cpp
     src/resp.cpp
-    src/commands.cpp)
+    src/commands.cpp
+    src/persistence.cpp)
 target_include_directories(redis-lite-tests PRIVATE include src)
 target_link_libraries(redis-lite-tests PRIVATE Threads::Threads)
 add_test(NAME redis-lite-tests COMMAND redis-lite-tests)

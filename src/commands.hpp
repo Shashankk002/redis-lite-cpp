@@ -2,6 +2,7 @@
 #define REDIS_LITE_COMMANDS_HPP
 
 #include <chrono>
+#include <iosfwd>
 #include <string>
 #include <unordered_map>
 
@@ -22,7 +23,11 @@ namespace redis_lite {
     // Executes one parsed request and returns the reply to send back.
     // Anything invalid produces a RESP error rather than an exception, so a
     // bad request can never take the server down.
-    RespValue execute_command(const RespValue& request, Store& store);
+    //
+    // `log` is the append-only file that state-changing commands are recorded
+    // in. Passing nullptr executes the command without recording it, which is
+    // exactly what replaying the log needs.
+    RespValue execute_command(const RespValue& request, Store& store, std::ofstream* log = nullptr);
 
 }  // namespace redis_lite
 

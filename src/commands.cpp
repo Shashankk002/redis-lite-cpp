@@ -2,6 +2,9 @@
 
 #include <cctype>
 #include <charconv>
+#include <fstream>
+
+#include "persistence.hpp"
 
 namespace redis_lite {
 
@@ -52,7 +55,7 @@ namespace redis_lite {
 
     }  // namespace
 
-    RespValue execute_command(const RespValue& request, Store& store) {
+    RespValue execute_command(const RespValue& request, Store& store, std::ofstream* log) {
         // Clients send commands as an array of bulk strings; anything else is
         // a client bug, not a command.
         if (request.type != RespType::Array || request.is_null || request.elements.empty()) {
@@ -81,6 +84,10 @@ namespace redis_lite {
             const std::string& key = request.elements[1].string;
             store.values[key] = request.elements[2].string;
             store.expirations.erase(key);  // a fresh SET clears any old TTL
+
+            // Replaying this record re-creates both effects: the value is set
+            // and any earlier expiration is dropped.
+            log_set(log, key, request.elements[2].string);
             return make_simple_string("OK");
         }
 
@@ -107,6 +114,12 @@ namespace redis_lite {
 
             const bool existed = store.values.count(key) > 0;
             remove_key(store, key);
+
+            // Only a DEL that removed something is worth recording; deleting a
+            // key that was not there changes no state.
+            if (existed) {
+                log_del(log, key);
+            }
             return make_integer(existed ? 1 : 0);
         }
 
@@ -127,13 +140,16 @@ namespace redis_lite {
                 return make_integer(0);  // nothing to expire
             }
 
-            // Redis deletes the key outright when the deadline is already past.
+            // Redis deletes the key outright when the deadline is already past,
+            // so that is what gets recorded too.
             if (seconds <= 0) {
                 remove_key(store, key);
+                log_del(log, key);
                 return make_integer(1);
             }
 
             store.expirations[key] = Clock::now() + std::chrono::seconds(seconds);
+            log_expire(log, key, seconds);
             return make_integer(1);
         }
 
