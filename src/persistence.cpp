@@ -2,7 +2,6 @@
 
 #include <chrono>
 #include <istream>
-#include <vector>
 
 #include "resp.hpp"
 
@@ -10,8 +9,33 @@ namespace redis_lite {
 
     namespace {
 
-        // Wall-clock seconds since the Unix epoch. Unlike steady_clock this
-        // survives a restart, which is the whole point for persisted deadlines.
+        struct RecordShape {
+            const char* verb;
+            int arguments;
+        };
+
+        const RecordShape kRecordShapes[] = {
+            {"SET",   2},
+            {"DEL",   1},
+            {"LPUSH", 2},
+            {"RPUSH", 2},
+            {"LPOP",  1},
+            {"RPOP",  1},
+            {"HSET",  3},
+            {"HDEL",  2},
+            {"SADD",  2},
+            {"SREM",  2},
+        };
+
+        int arguments_for(const std::string& verb) {
+            for (const RecordShape& shape : kRecordShapes) {
+                if (verb == shape.verb) {
+                    return shape.arguments;
+                }
+            }
+            return -1;
+        }
+
         long long unix_now() {
             const auto now = std::chrono::system_clock::now().time_since_epoch();
             return std::chrono::duration_cast<std::chrono::seconds>(now).count();
@@ -21,7 +45,6 @@ namespace redis_lite {
             log << text.size() << ' ' << text;
         }
 
-        // Reads one "<length> <bytes>" field.
         bool read_field(std::istream& in, std::string& out) {
             long long length = -1;
             if (!(in >> length) || length < 0) {
@@ -38,8 +61,6 @@ namespace redis_lite {
             return true;
         }
 
-        // Builds a request array, so replay runs through exactly the same
-        // execute_command() that a network client would reach.
         RespValue as_request(const std::vector<std::string>& words) {
             std::vector<RespValue> elements;
             for (const std::string& word : words) {
@@ -60,31 +81,20 @@ namespace redis_lite {
         return log.is_open();
     }
 
-    void log_set(std::ofstream* log, const std::string& key, const std::string& value) {
+    void log_command(std::ofstream* log,
+                     const std::string& verb,
+                     const std::vector<std::string>& arguments) {
         if (log == nullptr) {
             return;  // replaying: the record is already in the file
         }
 
-        *log << "SET ";
-        write_field(*log, key);
-        *log << ' ';
-        write_field(*log, value);
-        *log << '\n';
-
-        // flush() pushes our buffers into the OS. It is not fsync(): the bytes
-        // may still be sitting in the kernel's page cache if the machine loses
-        // power. See the README for the distinction.
-        log->flush();
-    }
-
-    void log_del(std::ofstream* log, const std::string& key) {
-        if (log == nullptr) {
-            return;
+        *log << verb;
+        for (const std::string& argument : arguments) {
+            *log << ' ';
+            write_field(*log, argument);
         }
-
-        *log << "DEL ";
-        write_field(*log, key);
         *log << '\n';
+
         log->flush();
     }
 
@@ -93,8 +103,6 @@ namespace redis_lite {
             return;
         }
 
-        // Stored as an absolute wall-clock deadline, so a restart can work out
-        // how much life the key has left.
         *log << "EXPIRE ";
         write_field(*log, key);
         *log << ' ' << (unix_now() + seconds_from_now) << '\n';
@@ -107,8 +115,6 @@ namespace redis_lite {
             return true;  // no file yet: a fresh server starts empty
         }
 
-        // Replay into a scratch store so a malformed file cannot leave the real
-        // one half-populated.
         Store loaded;
         long long record_number = 0;
 
@@ -130,33 +136,7 @@ namespace redis_lite {
                 return false;
             }
 
-            if (verb == "SET") {
-                if (in.get() != ' ') {
-                    error = record_error(record_number, "expected a space before the value");
-                    return false;
-                }
-
-                std::string value;
-                if (!read_field(in, value)) {
-                    error = record_error(record_number, "bad value field");
-                    return false;
-                }
-                if (in.get() != '\n') {
-                    error = record_error(record_number, "record does not end with a newline");
-                    return false;
-                }
-
-                execute_command(as_request({"SET", key, value}), loaded, nullptr);
-
-            } else if (verb == "DEL") {
-                if (in.get() != '\n') {
-                    error = record_error(record_number, "record does not end with a newline");
-                    return false;
-                }
-
-                execute_command(as_request({"DEL", key}), loaded, nullptr);
-
-            } else if (verb == "EXPIRE") {
+            if (verb == "EXPIRE") {
                 if (in.get() != ' ') {
                     error = record_error(record_number, "expected a space before the deadline");
                     return false;
@@ -172,8 +152,6 @@ namespace redis_lite {
                     return false;
                 }
 
-                // Turn the stored wall-clock deadline back into a duration the
-                // in-memory (steady_clock) expiration understands.
                 const long long remaining = deadline - unix_now();
                 if (remaining <= 0) {
                     // The key's life ran out while the server was down.
@@ -182,11 +160,38 @@ namespace redis_lite {
                     execute_command(as_request({"EXPIRE", key, std::to_string(remaining)}),
                                     loaded, nullptr);
                 }
+                continue;
+            }
 
-            } else {
+            const int expected = arguments_for(verb);
+            if (expected < 0) {
                 error = record_error(record_number, "unknown record type '" + verb + "'");
                 return false;
             }
+
+            std::vector<std::string> words{verb, key};
+            for (int i = 1; i < expected; ++i) {
+                if (in.get() != ' ') {
+                    error = record_error(record_number, "expected a space before argument " +
+                                                            std::to_string(i + 1));
+                    return false;
+                }
+
+                std::string argument;
+                if (!read_field(in, argument)) {
+                    error = record_error(record_number,
+                                         "bad argument " + std::to_string(i + 1));
+                    return false;
+                }
+                words.push_back(argument);
+            }
+
+            if (in.get() != '\n') {
+                error = record_error(record_number, "record does not end with a newline");
+                return false;
+            }
+
+            execute_command(as_request(words), loaded, nullptr);
         }
 
         store = std::move(loaded);

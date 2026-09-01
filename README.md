@@ -13,22 +13,23 @@ over abstractions that might pay off later.
 
 ## Status
 
-**Stages 0–8 complete. A single-threaded, event-driven server with TTL and append-only persistence.**
+**Stages 0–9 complete. A single-threaded, event-driven server with four data types, TTL and append-only persistence.**
 
 What exists today:
 
 - A CMake build (C++17, warnings enabled) producing four executables.
 - `redis-lite-server`, which listens on **127.0.0.1:6379**, serves **many clients at once from
   a single thread** using a kqueue event loop, and executes `PING`, `SET`, `GET`, `DEL`,
-  `EXPIRE` and `TTL` over RESP until Ctrl+C. Data survives a restart via an append-only log.
+  `EXPIRE` and `TTL` over RESP, plus list, hash and set commands, until Ctrl+C. Data survives a
+  restart via an append-only log.
 - A RESP2 parser and serializer (`src/resp.hpp`, `src/resp.cpp`), now driving the server.
 - A command layer (`src/commands.hpp`, `src/commands.cpp`) holding the key-value store and
   its expiration deadlines.
-- `redis-lite-tests`, a plain test executable wired into CTest (283 checks).
+- `redis-lite-tests`, a plain test executable wired into CTest (462 checks).
 - `tcp-echo-server` and `tcp-echo-client` in `experiments/` — the Stage 1 exercise, kept as-is.
 
-What does **not** exist yet: every other Redis command, log compaction, and portability beyond
-macOS/BSD (see the note on `epoll` below).
+What does **not** exist yet: sorted sets and the rest of the Redis command set, log compaction,
+and portability beyond macOS/BSD (see the note on `epoll` below).
 Every stage below marked *planned* describes intent, not shipped code.
 
 ## Stage 3: the RESP protocol
@@ -691,6 +692,162 @@ cat /tmp/my.aof
 ./build/redis-lite-server /tmp/my.aof     # the keys are back
 ```
 
+## Stage 9: lists, hashes and sets
+
+### The data model
+
+Until Stage 8 every key held a string. Now a key holds exactly one of four things:
+
+```cpp
+using StringValue = std::string;
+using ListValue   = std::deque<std::string>;
+using HashValue   = std::unordered_map<std::string, std::string>;
+using SetValue    = std::unordered_set<std::string>;
+
+using Value = std::variant<StringValue, ListValue, HashValue, SetValue>;
+
+struct Store {
+    std::unordered_map<std::string, Value> values;
+    std::unordered_map<std::string, std::chrono::steady_clock::time_point> expirations;
+};
+```
+
+`std::variant` is doing real work here. The central rule of this stage — *a key cannot hold two
+types at once* — is not a rule the code has to remember to enforce; a variant holds exactly one
+alternative and there is no way to write down a key that is both a list and a hash.
+`std::get_if<T>` returns a null pointer for the wrong alternative, which maps directly onto the
+one error this stage needs.
+
+A `deque` for lists, rather than a `vector`, because `LPUSH`/`LPOP` work at the front: every
+left-hand push into a vector would shuffle the entire list.
+
+### Supported commands
+
+| Type | Commands |
+| ---- | -------- |
+| Connection | `PING` |
+| Generic | `DEL`, `EXPIRE`, `TTL` — these work on any type |
+| String | `SET`, `GET` |
+| List | `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LLEN`, `LRANGE` |
+| Hash | `HSET`, `HGET`, `HDEL`, `HEXISTS`, `HLEN` |
+| Set | `SADD`, `SREM`, `SISMEMBER`, `SCARD`, `SMEMBERS` |
+
+`LRANGE` supports negative indices the way Redis does: `-1` is the last element, so
+`LRANGE key 0 -1` is the whole list, and out-of-range bounds are clamped rather than rejected.
+
+Each of these takes a **single** value, field or member — `LPUSH key a b c` is not supported.
+Redis allows the variadic form; adding it is mechanical and was left out to keep the stage
+focused on the type system rather than on argument parsing.
+
+### Wrong-type semantics
+
+Using a command against a key holding another type returns the Redis error verbatim:
+
+```
+WRONGTYPE Operation against a key holding the wrong kind of value
+```
+
+Three rules make this predictable:
+
+- **A rejected command changes nothing.** It does not create the key, and it does not disturb
+  the existing value. `LPUSH` on a string leaves the string exactly as it was.
+- **`SET` is the exception, and replaces any type.** `SET key value` over a list turns the key
+  into a string and clears its TTL, matching Redis.
+- **Every other type transition requires an explicit `DEL` first**, or emptying the collection.
+
+`DEL`, `EXPIRE` and `TTL` are type-agnostic: they operate on the key, not on what it holds, so
+they never return WRONGTYPE.
+
+**Empty collections do not exist.** Popping the last element of a list, or removing the last
+field or member, deletes the key outright — so `LLEN` on it reads `0`, `TTL` reads `-2`, and the
+name is free to be reused for a different type. This matches Redis and is what keeps
+"missing key" and "empty collection" from being two different states to reason about.
+
+### TTL works on every type
+
+Expiration is a property of the key, so `EXPIRE mylist 60` is as valid as `EXPIRE mystring 60`.
+When the deadline passes, the whole collection disappears at once, and every command sees it as
+missing: `LLEN` gives `0`, `LRANGE` gives an empty array, `TTL` gives `-2`. The lazy-expiration
+mechanism from Stage 5 is unchanged — nothing scans in the background.
+
+### Persistence
+
+The Stage 8 format was already "a verb followed by length-prefixed arguments", so it generalised
+without changing a single existing byte. Old logs still load.
+
+```
+SET    <klen> <key> <vlen> <value>       LPUSH  <klen> <key> <vlen> <value>
+DEL    <klen> <key>                      RPUSH  <klen> <key> <vlen> <value>
+EXPIRE <klen> <key> <unix-deadline>      LPOP   <klen> <key>
+                                         RPOP   <klen> <key>
+HSET   <klen> <key> <flen> <field> <vlen> <value>
+HDEL   <klen> <key> <flen> <field>
+SADD   <klen> <key> <mlen> <member>
+SREM   <klen> <key> <mlen> <member>
+```
+
+The reader is now a small table of verb → argument count, so adding a command means adding one
+row rather than another parsing branch. `EXPIRE` remains the one special case, because its tail
+is a number rather than arbitrary bytes.
+
+Two things fall out of replaying through the *same* `execute_command` a client reaches:
+
+- **Emptied collections are handled for free.** Replaying the `LPOP` that emptied a list empties
+  it again, and the same `drop_if_empty` removes the key. No `DEL` record is needed.
+- **Only real changes are recorded.** A duplicate `SADD`, an `HDEL` of an absent field, or an
+  `SREM` of a non-member change no state, so nothing is written.
+
+Replay still passes `nullptr` as the log, so it never writes back into the file it is reading.
+
+### Trying it
+
+```bash
+./demo_datatypes.sh
+```
+
+Or by hand — `nc` speaks RESP if you feed it the right bytes:
+
+```bash
+# RPUSH fruits apple
+printf '*3\r\n$5\r\nRPUSH\r\n$6\r\nfruits\r\n$5\r\napple\r\n' | nc -w2 127.0.0.1 6379
+
+# LRANGE fruits 0 -1
+printf '*4\r\n$6\r\nLRANGE\r\n$6\r\nfruits\r\n$1\r\n0\r\n$2\r\n-1\r\n' | nc -w2 127.0.0.1 6379
+```
+
+`demo_datatypes.sh` contains a `resp()` shell function that builds these for you.
+
+### Design tradeoffs
+
+**`std::variant` over a struct with a type tag.** Stage 3's `RespValue` uses the tagged-struct
+pattern, and consistency argued for repeating it. But there, the alternatives were tiny and the
+invariant was not the point. Here a struct would carry an empty `deque`, `unordered_map` *and*
+`unordered_set` on every key — well over a hundred bytes of dead weight on a plain string — and,
+worse, nothing would stop code from reading the wrong member for the tag. The variant makes the
+illegal state unrepresentable, which is precisely what this stage is about. The cost is
+`std::get_if` at each use, and a variant as large as its biggest alternative.
+
+**Two small function templates** (`read_typed` / `write_typed`) rather than sixteen copies of
+the same lookup-and-check. `read_typed` deliberately reports "missing" and "wrong type"
+separately, because they have different replies.
+
+**`unordered_map`/`unordered_set` for hashes and sets** means `SMEMBERS` returns members in an
+unspecified order. Redis makes the same guarantee (none), so this is correct — but it means
+tests must compare members as a set, which they do.
+
+### Known limitations
+
+- **Single-value commands only.** No `LPUSH key a b c`, no `HSET key f1 v1 f2 v2`, no multi-key
+  `DEL`.
+- **No sorted sets**, and none of `LINSERT`, `LSET`, `LREM`, `HGETALL`, `HKEYS`, `HVALS`,
+  `SINTER`, `SUNION`, `SDIFF`, `SPOP`, `TYPE`, `EXISTS`, or `KEYS`.
+- **No per-type encodings.** Real Redis switches representation by size (ziplist/listpack for
+  small collections, hashtable for large). Everything here is one representation per type.
+- **`SMEMBERS` and `LRANGE` build the whole reply in memory** before sending, so a very large
+  collection produces a very large output buffer.
+- **The log still grows forever** — a list that is pushed and popped a million times keeps all
+  two million records. Compaction remains the future improvement it was in Stage 8.
+
 ## Trying the server
 
 ```bash
@@ -753,7 +910,7 @@ and port 6380 rather than 6379 so it never collides with a real Redis.
 | 6 | Concurrency: one thread per client, mutex-guarded store | **Done** |
 | 7 | Event loop: non-blocking I/O with kqueue, single-threaded | **Done** |
 | 8 | Persistence: an append-only log | **Done** |
-| 9 | Richer data types: lists, hashes, sets | Planned |
+| 9 | Richer data types: lists, hashes, sets | **Done** |
 | 10 | Benchmarks and tuning | Planned |
 
 Stage boundaries may shift; the table records the intended order.
@@ -768,6 +925,7 @@ Stage boundaries may shift; the table records the intended order.
 ├── experiments/     standalone learning exercises, not part of the server
 ├── demo_event_loop.sh   scripted demonstration of the event loop
 ├── demo_persistence.sh  scripted demonstration of restart persistence
+├── demo_datatypes.sh    scripted demonstration of lists, hashes and sets
 └── benchmarks/      reserved for a later stage; empty
 ```
 

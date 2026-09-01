@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <variant>
 #include <utility>
 #include <vector>
 
@@ -1238,6 +1239,17 @@ static void test_malformed_log_is_refused() {
     remove_log();
 }
 
+// The store now holds a variant, so a test that wants the string behind a key
+// has to ask for that alternative.
+static std::string string_at(Store& store, const std::string& key) {
+    const auto found = store.values.find(key);
+    if (found == store.values.end()) {
+        return "<missing>";
+    }
+    const redis_lite::StringValue* text = std::get_if<redis_lite::StringValue>(&found->second);
+    return (text == nullptr) ? "<not a string>" : *text;
+}
+
 static void test_binary_safe_keys_and_values() {
     std::cout << "\n-- persistence: awkward keys and values survive --\n";
 
@@ -1262,14 +1274,618 @@ static void test_binary_safe_keys_and_values() {
     check(redis_lite::replay_log(kLogPath, restored, error), "the log replays");
     check_equal(error, "", "no error for awkward data");
 
-    check_equal(restored.values[spaced_key], newline_value,
+    check_equal(string_at(restored, spaced_key), newline_value,
                 "a key with spaces and a value with newlines round-trip");
-    check(restored.values.count("empty") == 1 && restored.values["empty"].empty(),
+    check(restored.values.count("empty") == 1 && string_at(restored, "empty").empty(),
           "an empty value round-trips");
-    check_equal(restored.values["tricky"], numeric_looking,
+    check_equal(string_at(restored, "tricky"), numeric_looking,
                 "a value that looks like a length prefix round-trips");
-    check_equal(restored.values["SET 3 foo"], "looks like a record",
+    check_equal(string_at(restored, "SET 3 foo"), "looks like a record",
                 "a key that looks like a whole record round-trips");
+
+    remove_log();
+}
+
+// ---------------------------------------------------------------------------
+// Stage 9: lists, hashes and sets.
+// ---------------------------------------------------------------------------
+
+static bool is_wrong_type(const std::string& reply) {
+    return reply.rfind("-WRONGTYPE ", 0) == 0;
+}
+
+// Parses an array reply and returns its elements sorted, so tests never depend
+// on the iteration order of an unordered_set.
+static std::string sorted_members(const std::string& serialized) {
+    const ParseResult result = parse(serialized);
+    if (result.status != ParseStatus::Ok || result.value.type != RespType::Array) {
+        return "<not an array>";
+    }
+
+    std::vector<std::string> members;
+    for (const RespValue& element : result.value.elements) {
+        members.push_back(element.string);
+    }
+    std::sort(members.begin(), members.end());
+
+    std::string joined;
+    for (const std::string& member : members) {
+        joined += member;
+        joined += "|";
+    }
+    return joined;
+}
+
+// Elements of an array reply in the order the server sent them (lists care).
+static std::string ordered_elements(const std::string& serialized) {
+    const ParseResult result = parse(serialized);
+    if (result.status != ParseStatus::Ok || result.value.type != RespType::Array) {
+        return "<not an array>";
+    }
+
+    std::string joined;
+    for (const RespValue& element : result.value.elements) {
+        joined += element.string;
+        joined += "|";
+    }
+    return joined;
+}
+
+static void test_lists() {
+    std::cout << "\n-- lists --\n";
+
+    Store store;
+
+    check_equal(run(store, {"LLEN", "mylist"}), ":0\r\n", "LLEN of a missing key is 0");
+    check_equal(run(store, {"LPOP", "mylist"}), "$-1\r\n", "LPOP of a missing key is nil");
+    check_equal(run(store, {"RPOP", "mylist"}), "$-1\r\n", "RPOP of a missing key is nil");
+    check_equal(ordered_elements(run(store, {"LRANGE", "mylist", "0", "-1"})), "",
+                "LRANGE of a missing key is empty");
+
+    check_equal(run(store, {"RPUSH", "mylist", "b"}), ":1\r\n", "RPUSH creates the list");
+    check_equal(run(store, {"RPUSH", "mylist", "c"}), ":2\r\n", "RPUSH appends on the right");
+    check_equal(run(store, {"LPUSH", "mylist", "a"}), ":3\r\n", "LPUSH prepends on the left");
+    check_equal(run(store, {"LLEN", "mylist"}), ":3\r\n", "LLEN counts the elements");
+    check_equal(ordered_elements(run(store, {"LRANGE", "mylist", "0", "-1"})), "a|b|c|",
+                "the list reads a, b, c in order");
+
+    check_equal(run(store, {"LPOP", "mylist"}), "$1\r\na\r\n", "LPOP takes from the left");
+    check_equal(run(store, {"RPOP", "mylist"}), "$1\r\nc\r\n", "RPOP takes from the right");
+    check_equal(run(store, {"LLEN", "mylist"}), ":1\r\n", "one element is left");
+
+    // Emptying a list removes the key, exactly as Redis does.
+    check_equal(run(store, {"LPOP", "mylist"}), "$1\r\nb\r\n", "the last element pops");
+    check_equal(run(store, {"LLEN", "mylist"}), ":0\r\n", "the emptied list reports length 0");
+    check(store.values.count("mylist") == 0, "the emptied list is removed from the store");
+    check_equal(run(store, {"TTL", "mylist"}), ":-2\r\n", "the emptied key reports -2");
+
+    // Repeated operations, and duplicate values, are fine.
+    for (int i = 0; i < 5; ++i) {
+        run(store, {"RPUSH", "repeat", "same"});
+    }
+    check_equal(run(store, {"LLEN", "repeat"}), ":5\r\n", "duplicates are kept, not deduplicated");
+    check_equal(ordered_elements(run(store, {"LRANGE", "repeat", "0", "-1"})),
+                "same|same|same|same|same|", "all five duplicates are present");
+
+    // Arity.
+    check(run(store, {"LPUSH"}).rfind("-ERR wrong number", 0) == 0, "LPUSH needs arguments");
+    check(run(store, {"LPUSH", "k"}).rfind("-ERR wrong number", 0) == 0, "LPUSH needs a value");
+    check(run(store, {"LPOP", "k", "extra"}).rfind("-ERR wrong number", 0) == 0,
+          "LPOP takes exactly one key");
+    check(run(store, {"LRANGE", "k", "0"}).rfind("-ERR wrong number", 0) == 0,
+          "LRANGE needs start and stop");
+    check(run(store, {"LRANGE", "k", "a", "b"}).rfind("-ERR value is not an integer", 0) == 0,
+          "LRANGE rejects non-numeric bounds");
+}
+
+static void test_list_ranges() {
+    std::cout << "\n-- LRANGE, including negative indices --\n";
+
+    Store store;
+    for (const std::string& value : {"a", "b", "c", "d", "e"}) {
+        run(store, {"RPUSH", "letters", value});
+    }
+
+    check_equal(ordered_elements(run(store, {"LRANGE", "letters", "0", "-1"})), "a|b|c|d|e|",
+                "0 to -1 is the whole list");
+    check_equal(ordered_elements(run(store, {"LRANGE", "letters", "0", "0"})), "a|",
+                "0 to 0 is the first element");
+    check_equal(ordered_elements(run(store, {"LRANGE", "letters", "1", "3"})), "b|c|d|",
+                "a middle range");
+    check_equal(ordered_elements(run(store, {"LRANGE", "letters", "-2", "-1"})), "d|e|",
+                "negative indices count from the end");
+    check_equal(ordered_elements(run(store, {"LRANGE", "letters", "-100", "100"})), "a|b|c|d|e|",
+                "out-of-range bounds are clamped");
+    check_equal(ordered_elements(run(store, {"LRANGE", "letters", "3", "1"})), "",
+                "a reversed range is empty");
+    check_equal(ordered_elements(run(store, {"LRANGE", "letters", "10", "20"})), "",
+                "a range past the end is empty");
+}
+
+static void test_hashes() {
+    std::cout << "\n-- hashes --\n";
+
+    Store store;
+
+    check_equal(run(store, {"HLEN", "user"}), ":0\r\n", "HLEN of a missing key is 0");
+    check_equal(run(store, {"HGET", "user", "name"}), "$-1\r\n", "HGET of a missing key is nil");
+    check_equal(run(store, {"HEXISTS", "user", "name"}), ":0\r\n",
+                "HEXISTS on a missing key is 0");
+    check_equal(run(store, {"HDEL", "user", "name"}), ":0\r\n", "HDEL on a missing key is 0");
+
+    check_equal(run(store, {"HSET", "user", "name", "Shashank"}), ":1\r\n",
+                "HSET returns 1 for a new field");
+    check_equal(run(store, {"HSET", "user", "city", "Hyderabad"}), ":1\r\n",
+                "a second new field also returns 1");
+    check_equal(run(store, {"HSET", "user", "name", "Shash"}), ":0\r\n",
+                "HSET returns 0 when updating an existing field");
+
+    check_equal(run(store, {"HGET", "user", "name"}), "$5\r\nShash\r\n",
+                "the updated value is returned");
+    check_equal(run(store, {"HGET", "user", "city"}), "$9\r\nHyderabad\r\n",
+                "the other field is untouched");
+    check_equal(run(store, {"HGET", "user", "missing"}), "$-1\r\n",
+                "a missing field is nil");
+    check_equal(run(store, {"HLEN", "user"}), ":2\r\n", "HLEN counts the fields");
+    check_equal(run(store, {"HEXISTS", "user", "name"}), ":1\r\n", "HEXISTS finds a field");
+    check_equal(run(store, {"HEXISTS", "user", "missing"}), ":0\r\n",
+                "HEXISTS does not find a missing field");
+
+    check_equal(run(store, {"HDEL", "user", "city"}), ":1\r\n", "HDEL removes a field");
+    check_equal(run(store, {"HDEL", "user", "city"}), ":0\r\n",
+                "HDEL on an already-removed field is 0");
+    check_equal(run(store, {"HLEN", "user"}), ":1\r\n", "the field count drops");
+
+    // Emptying a hash removes the key.
+    check_equal(run(store, {"HDEL", "user", "name"}), ":1\r\n", "the last field is removed");
+    check(store.values.count("user") == 0, "the emptied hash is removed from the store");
+    check_equal(run(store, {"HLEN", "user"}), ":0\r\n", "the emptied hash reports length 0");
+
+    // Fields and values may contain anything.
+    run(store, {"HSET", "odd", "field with spaces", "value\r\nwith newlines"});
+    check_equal(run(store, {"HGET", "odd", "field with spaces"}),
+                "$20\r\nvalue\r\nwith newlines\r\n", "awkward fields and values work");
+
+    check(run(store, {"HSET", "k", "f"}).rfind("-ERR wrong number", 0) == 0,
+          "HSET needs field and value");
+    check(run(store, {"HGET", "k"}).rfind("-ERR wrong number", 0) == 0, "HGET needs a field");
+    check(run(store, {"HLEN"}).rfind("-ERR wrong number", 0) == 0, "HLEN needs a key");
+}
+
+static void test_sets() {
+    std::cout << "\n-- sets --\n";
+
+    Store store;
+
+    check_equal(run(store, {"SCARD", "tags"}), ":0\r\n", "SCARD of a missing key is 0");
+    check_equal(run(store, {"SISMEMBER", "tags", "a"}), ":0\r\n",
+                "SISMEMBER on a missing key is 0");
+    check_equal(run(store, {"SREM", "tags", "a"}), ":0\r\n", "SREM on a missing key is 0");
+    check_equal(sorted_members(run(store, {"SMEMBERS", "tags"})), "",
+                "SMEMBERS of a missing key is empty");
+
+    check_equal(run(store, {"SADD", "tags", "red"}), ":1\r\n", "SADD adds a new member");
+    check_equal(run(store, {"SADD", "tags", "green"}), ":1\r\n", "SADD adds a second member");
+    check_equal(run(store, {"SADD", "tags", "red"}), ":0\r\n",
+                "SADD returns 0 for a duplicate");
+    check_equal(run(store, {"SCARD", "tags"}), ":2\r\n", "the duplicate did not grow the set");
+
+    check_equal(sorted_members(run(store, {"SMEMBERS", "tags"})), "green|red|",
+                "SMEMBERS returns both members");
+    check_equal(run(store, {"SISMEMBER", "tags", "red"}), ":1\r\n", "SISMEMBER finds a member");
+    check_equal(run(store, {"SISMEMBER", "tags", "blue"}), ":0\r\n",
+                "SISMEMBER does not find a non-member");
+
+    check_equal(run(store, {"SREM", "tags", "red"}), ":1\r\n", "SREM removes a member");
+    check_equal(run(store, {"SREM", "tags", "red"}), ":0\r\n",
+                "SREM on an already-removed member is 0");
+    check_equal(run(store, {"SCARD", "tags"}), ":1\r\n", "the cardinality drops");
+
+    // Emptying a set removes the key.
+    check_equal(run(store, {"SREM", "tags", "green"}), ":1\r\n", "the last member is removed");
+    check(store.values.count("tags") == 0, "the emptied set is removed from the store");
+    check_equal(run(store, {"SCARD", "tags"}), ":0\r\n", "the emptied set reports 0");
+
+    check(run(store, {"SADD", "k"}).rfind("-ERR wrong number", 0) == 0, "SADD needs a member");
+    check(run(store, {"SCARD"}).rfind("-ERR wrong number", 0) == 0, "SCARD needs a key");
+    check(run(store, {"SMEMBERS", "k", "extra"}).rfind("-ERR wrong number", 0) == 0,
+          "SMEMBERS takes exactly one key");
+}
+
+static void test_wrong_type_errors() {
+    std::cout << "\n-- WRONGTYPE: one key holds exactly one type --\n";
+
+    const std::vector<std::vector<std::string>> string_commands = {
+        {"GET", "k"},
+    };
+    const std::vector<std::vector<std::string>> list_commands = {
+        {"LPUSH", "k", "v"}, {"RPUSH", "k", "v"}, {"LPOP", "k"},
+        {"RPOP", "k"}, {"LLEN", "k"}, {"LRANGE", "k", "0", "-1"},
+    };
+    const std::vector<std::vector<std::string>> hash_commands = {
+        {"HSET", "k", "f", "v"}, {"HGET", "k", "f"}, {"HDEL", "k", "f"},
+        {"HEXISTS", "k", "f"}, {"HLEN", "k"},
+    };
+    const std::vector<std::vector<std::string>> set_commands = {
+        {"SADD", "k", "m"}, {"SREM", "k", "m"}, {"SISMEMBER", "k", "m"},
+        {"SCARD", "k"}, {"SMEMBERS", "k"},
+    };
+
+    struct Holder {
+        std::vector<std::string> create;
+        std::string description;
+        std::vector<std::vector<std::vector<std::string>>> foreign;
+    };
+
+    const std::vector<Holder> holders = {
+        {{"SET", "k", "text"},        "a string", {list_commands, hash_commands, set_commands}},
+        {{"RPUSH", "k", "item"},      "a list",   {string_commands, hash_commands, set_commands}},
+        {{"HSET", "k", "f", "v"},     "a hash",   {string_commands, list_commands, set_commands}},
+        {{"SADD", "k", "m"},          "a set",    {string_commands, list_commands, hash_commands}},
+    };
+
+    for (const Holder& holder : holders) {
+        int rejected = 0;
+        int attempted = 0;
+
+        for (const auto& family : holder.foreign) {
+            for (const std::vector<std::string>& command : family) {
+                Store store;
+                run(store, holder.create);
+
+                ++attempted;
+                if (is_wrong_type(run(store, command))) {
+                    ++rejected;
+                }
+            }
+        }
+
+        check(rejected == attempted,
+              "every foreign command against " + holder.description + " returns WRONGTYPE (" +
+                  std::to_string(rejected) + "/" + std::to_string(attempted) + ")");
+    }
+
+    // A rejected command must not create or damage anything.
+    Store store;
+    run(store, {"SET", "k", "text"});
+    check(is_wrong_type(run(store, {"LPUSH", "k", "v"})), "LPUSH on a string is rejected");
+    check_equal(run(store, {"GET", "k"}), "$4\r\ntext\r\n", "the string is unharmed");
+    check(store.values.size() == 1, "no extra key was created");
+
+    check(is_wrong_type(run(store, {"HSET", "k", "f", "v"})), "HSET on a string is rejected");
+    check(store.values.size() == 1, "a rejected HSET creates nothing");
+
+    // DEL and TTL are type-agnostic and must keep working.
+    Store mixed;
+    run(mixed, {"RPUSH", "l", "x"});
+    run(mixed, {"HSET", "h", "f", "v"});
+    run(mixed, {"SADD", "s", "m"});
+    check_equal(run(mixed, {"DEL", "l"}), ":1\r\n", "DEL removes a list");
+    check_equal(run(mixed, {"DEL", "h"}), ":1\r\n", "DEL removes a hash");
+    check_equal(run(mixed, {"DEL", "s"}), ":1\r\n", "DEL removes a set");
+    check(mixed.values.empty(), "DEL works on every type");
+}
+
+static void test_ttl_with_every_type() {
+    std::cout << "\n-- TTL applies to every value type --\n";
+
+    Store store;
+    run(store, {"SET", "s", "text"});
+    run(store, {"RPUSH", "l", "item"});
+    run(store, {"HSET", "h", "f", "v"});
+    run(store, {"SADD", "t", "m"});
+
+    for (const std::string& key : {"s", "l", "h", "t"}) {
+        check_equal(run(store, {"TTL", key}), ":-1\r\n", "TTL is -1 for key '" + key + "'");
+        check_equal(run(store, {"EXPIRE", key, "60"}), ":1\r\n",
+                    "EXPIRE works on key '" + key + "'");
+        check_equal(run(store, {"TTL", key}), ":60\r\n", "TTL reports 60 for key '" + key + "'");
+    }
+
+    // EXPIRE 0 deletes, whatever the type.
+    for (const std::string& key : {"l", "h", "t"}) {
+        check_equal(run(store, {"EXPIRE", key, "0"}), ":1\r\n",
+                    "EXPIRE 0 succeeds on key '" + key + "'");
+        check_equal(run(store, {"TTL", key}), ":-2\r\n", "key '" + key + "' is gone");
+        check(store.values.count(key) == 0, "key '" + key + "' left nothing behind");
+    }
+
+    // And a real deadline elapsing works for a collection too.
+    Store timed;
+    run(timed, {"RPUSH", "list", "a"});
+    run(timed, {"RPUSH", "list", "b"});
+    run(timed, {"EXPIRE", "list", "1"});
+    check_equal(run(timed, {"LLEN", "list"}), ":2\r\n", "the list is alive before its deadline");
+
+    sleep_ms(1200);
+
+    check_equal(run(timed, {"LLEN", "list"}), ":0\r\n", "the expired list reads as empty");
+    check_equal(run(timed, {"LRANGE", "list", "0", "-1"}), "*0\r\n",
+                "LRANGE on the expired list is empty");
+    check(timed.values.count("list") == 0, "the expired list was actually removed");
+}
+
+static void test_replacement_semantics() {
+    std::cout << "\n-- replacing a key with another type --\n";
+
+    Store store;
+
+    // SET overwrites any type, and clears the TTL along with it.
+    run(store, {"RPUSH", "k", "a"});
+    run(store, {"RPUSH", "k", "b"});
+    run(store, {"EXPIRE", "k", "100"});
+    check_equal(run(store, {"TTL", "k"}), ":100\r\n", "the list has a TTL");
+
+    check_equal(run(store, {"SET", "k", "now a string"}), "+OK\r\n", "SET replaces the list");
+    check_equal(run(store, {"GET", "k"}), "$12\r\nnow a string\r\n", "the string is readable");
+    check(is_wrong_type(run(store, {"LLEN", "k"})), "the key is no longer a list");
+    check_equal(run(store, {"TTL", "k"}), ":-1\r\n", "SET cleared the list's TTL");
+
+    // Other types are never replaced implicitly; DEL first.
+    check(is_wrong_type(run(store, {"RPUSH", "k", "x"})), "RPUSH will not replace a string");
+    check_equal(run(store, {"DEL", "k"}), ":1\r\n", "DEL removes it");
+    check_equal(run(store, {"RPUSH", "k", "x"}), ":1\r\n", "the key can be recreated as a list");
+    check_equal(run(store, {"LLEN", "k"}), ":1\r\n", "and behaves as a list");
+
+    // Emptying a collection frees the name for a different type.
+    run(store, {"LPOP", "k"});
+    check(store.values.count("k") == 0, "the emptied list released the key");
+    check_equal(run(store, {"SADD", "k", "m"}), ":1\r\n", "the name is reusable as a set");
+    check_equal(run(store, {"SCARD", "k"}), ":1\r\n", "and behaves as a set");
+
+    // A stale TTL must not follow a key into its next life.
+    Store second;
+    run(second, {"HSET", "h", "f", "v"});
+    run(second, {"EXPIRE", "h", "100"});
+    run(second, {"DEL", "h"});
+    run(second, {"SADD", "h", "m"});
+    check_equal(run(second, {"TTL", "h"}), ":-1\r\n",
+                "the recreated key has no leftover expiration");
+}
+
+static void test_persistence_of_collections() {
+    std::cout << "\n-- persistence: lists, hashes and sets --\n";
+
+    remove_log();
+    {
+        Store store;
+        std::ofstream log;
+        redis_lite::open_log(kLogPath, log);
+
+        run_logged(store, log, {"RPUSH", "list", "b"});
+        run_logged(store, log, {"LPUSH", "list", "a"});
+        run_logged(store, log, {"RPUSH", "list", "c"});
+        run_logged(store, log, {"HSET", "hash", "field", "value"});
+        run_logged(store, log, {"HSET", "hash", "other", "thing"});
+        run_logged(store, log, {"SADD", "set", "x"});
+        run_logged(store, log, {"SADD", "set", "y"});
+        run_logged(store, log, {"SADD", "set", "x"});  // duplicate: no state change
+    }
+
+    const std::string contents = read_log();
+    check(contents.find("RPUSH 4 list 1 b\n") != std::string::npos, "RPUSH is recorded");
+    check(contents.find("LPUSH 4 list 1 a\n") != std::string::npos, "LPUSH is recorded");
+    check(contents.find("HSET 4 hash 5 field 5 value\n") != std::string::npos,
+          "HSET is recorded with field and value");
+    check(contents.find("SADD 3 set 1 x\n") != std::string::npos, "SADD is recorded");
+
+    // The duplicate SADD changed nothing, so it must not appear a second time.
+    std::size_t sadd_x_count = 0;
+    for (std::size_t at = contents.find("SADD 3 set 1 x\n");
+         at != std::string::npos;
+         at = contents.find("SADD 3 set 1 x\n", at + 1)) {
+        ++sadd_x_count;
+    }
+    check(sadd_x_count == 1, "a duplicate SADD is not recorded");
+
+    Store restored;
+    std::string error;
+    check(redis_lite::replay_log(kLogPath, restored, error), "the log replays");
+    check_equal(error, "", "no error replaying collections");
+
+    check_equal(ordered_elements(run(restored, {"LRANGE", "list", "0", "-1"})), "a|b|c|",
+                "the list is restored in the right order");
+    check_equal(run(restored, {"HGET", "hash", "field"}), "$5\r\nvalue\r\n",
+                "a hash field is restored");
+    check_equal(run(restored, {"HLEN", "hash"}), ":2\r\n", "both hash fields are restored");
+    check_equal(sorted_members(run(restored, {"SMEMBERS", "set"})), "x|y|",
+                "the set members are restored");
+    check_equal(run(restored, {"SCARD", "set"}), ":2\r\n", "the set has the right size");
+
+    remove_log();
+}
+
+static void test_persistence_of_collection_removals() {
+    std::cout << "\n-- persistence: pops and removals replay correctly --\n";
+
+    remove_log();
+    {
+        Store store;
+        std::ofstream log;
+        redis_lite::open_log(kLogPath, log);
+
+        for (const std::string& value : {"a", "b", "c", "d"}) {
+            run_logged(store, log, {"RPUSH", "list", value});
+        }
+        run_logged(store, log, {"LPOP", "list"});   // drops "a"
+        run_logged(store, log, {"RPOP", "list"});   // drops "d"
+
+        run_logged(store, log, {"HSET", "hash", "keep", "1"});
+        run_logged(store, log, {"HSET", "hash", "drop", "2"});
+        run_logged(store, log, {"HDEL", "hash", "drop"});
+        run_logged(store, log, {"HDEL", "hash", "absent"});  // no state change
+
+        run_logged(store, log, {"SADD", "set", "keep"});
+        run_logged(store, log, {"SADD", "set", "drop"});
+        run_logged(store, log, {"SREM", "set", "drop"});
+        run_logged(store, log, {"SREM", "set", "absent"});  // no state change
+    }
+
+    const std::string contents = read_log();
+    check(contents.find("LPOP 4 list\n") != std::string::npos, "LPOP is recorded");
+    check(contents.find("RPOP 4 list\n") != std::string::npos, "RPOP is recorded");
+    check(contents.find("HDEL 4 hash 4 drop\n") != std::string::npos, "HDEL is recorded");
+    check(contents.find("HDEL 4 hash 6 absent\n") == std::string::npos,
+          "an HDEL that removed nothing is not recorded");
+    check(contents.find("SREM 3 set 4 drop\n") != std::string::npos, "SREM is recorded");
+    check(contents.find("SREM 3 set 6 absent\n") == std::string::npos,
+          "an SREM that removed nothing is not recorded");
+
+    Store restored;
+    std::string error;
+    check(redis_lite::replay_log(kLogPath, restored, error), "the log replays");
+
+    check_equal(ordered_elements(run(restored, {"LRANGE", "list", "0", "-1"})), "b|c|",
+                "the popped elements are gone after replay");
+    check_equal(run(restored, {"HLEN", "hash"}), ":1\r\n", "the deleted hash field stays deleted");
+    check_equal(run(restored, {"HEXISTS", "hash", "drop"}), ":0\r\n", "HDEL survived the restart");
+    check_equal(sorted_members(run(restored, {"SMEMBERS", "set"})), "keep|",
+                "the removed set member stays removed");
+
+    remove_log();
+}
+
+static void test_persistence_emptied_collections() {
+    std::cout << "\n-- persistence: a collection emptied to nothing --\n";
+
+    remove_log();
+    {
+        Store store;
+        std::ofstream log;
+        redis_lite::open_log(kLogPath, log);
+
+        run_logged(store, log, {"RPUSH", "gone", "only"});
+        run_logged(store, log, {"LPOP", "gone"});          // empties, so the key is removed
+        run_logged(store, log, {"SADD", "gone", "member"}); // the name is reused as a set
+    }
+
+    Store restored;
+    std::string error;
+    check(redis_lite::replay_log(kLogPath, restored, error), "the log replays");
+    check_equal(run(restored, {"SCARD", "gone"}), ":1\r\n",
+                "the key came back as a set, not a list");
+    check(is_wrong_type(run(restored, {"LLEN", "gone"})),
+          "the old list type did not survive");
+
+    remove_log();
+}
+
+static void test_persistence_collection_ttl() {
+    std::cout << "\n-- persistence: a TTL on a collection --\n";
+
+    remove_log();
+    {
+        Store store;
+        std::ofstream log;
+        redis_lite::open_log(kLogPath, log);
+
+        run_logged(store, log, {"RPUSH", "alive", "x"});
+        run_logged(store, log, {"EXPIRE", "alive", "600"});
+        run_logged(store, log, {"HSET", "doomed", "f", "v"});
+    }
+
+    // Give the doomed hash a deadline that already passed.
+    const long long now = static_cast<long long>(std::time(nullptr));
+    std::ofstream append(kLogPath, std::ios::app | std::ios::binary);
+    append << "EXPIRE 6 doomed " << (now - 60) << "\n";
+    append.close();
+
+    Store restored;
+    std::string error;
+    check(redis_lite::replay_log(kLogPath, restored, error), "the log replays");
+
+    check_equal(run(restored, {"LLEN", "alive"}), ":1\r\n", "the list survived the restart");
+    const std::string ttl = run(restored, {"TTL", "alive"});
+    check(ttl == ":600\r\n" || ttl == ":599\r\n", "its TTL came back roughly intact");
+
+    check_equal(run(restored, {"HLEN", "doomed"}), ":0\r\n", "the expired hash is gone");
+    check(restored.values.count("doomed") == 0, "the expired hash left nothing behind");
+
+    remove_log();
+}
+
+static void test_persistence_replay_is_still_read_only() {
+    std::cout << "\n-- persistence: replaying collections writes nothing back --\n";
+
+    remove_log();
+    {
+        Store store;
+        std::ofstream log;
+        redis_lite::open_log(kLogPath, log);
+        run_logged(store, log, {"RPUSH", "list", "a"});
+        run_logged(store, log, {"HSET", "hash", "f", "v"});
+        run_logged(store, log, {"SADD", "set", "m"});
+        run_logged(store, log, {"LPOP", "list"});
+    }
+
+    const std::string before = read_log();
+    for (int i = 0; i < 5; ++i) {
+        Store scratch;
+        std::string error;
+        redis_lite::replay_log(kLogPath, scratch, error);
+    }
+    check_equal(read_log(), before, "five replays leave the log byte-for-byte identical");
+
+    remove_log();
+}
+
+static void test_persistence_malformed_collection_records() {
+    std::cout << "\n-- persistence: malformed collection records are refused --\n";
+
+    const std::vector<std::pair<std::string, std::string>> broken = {
+        {"HSET 4 hash 5 field\n",        "an HSET missing its value"},
+        {"LPUSH 4 list\n",               "an LPUSH missing its value"},
+        {"SADD 3 set\n",                 "an SADD missing its member"},
+        {"HSET 4 hash 99 field 1 v\n",   "an HSET field length past the end"},
+        {"LPOP 4 list 1 x\n",            "an LPOP with a stray extra argument"},
+        {"ZADD 3 key 1 m\n",             "a verb we do not implement"},
+    };
+
+    for (const auto& entry : broken) {
+        write_log(entry.first);
+
+        Store store;
+        run(store, {"SET", "existing", "value"});
+
+        std::string error;
+        const bool ok = redis_lite::replay_log(kLogPath, store, error);
+
+        check(!ok, std::string("replay refuses ") + entry.second);
+        check(!error.empty(), std::string("an error is reported for ") + entry.second);
+        check_equal(run(store, {"GET", "existing"}), "$5\r\nvalue\r\n",
+                    std::string("the store is untouched after ") + entry.second);
+    }
+
+    remove_log();
+}
+
+static void test_persistence_awkward_collection_data() {
+    std::cout << "\n-- persistence: awkward collection data survives --\n";
+
+    remove_log();
+    {
+        Store store;
+        std::ofstream log;
+        redis_lite::open_log(kLogPath, log);
+        run_logged(store, log, {"RPUSH", "list", "an item with spaces"});
+        run_logged(store, log, {"RPUSH", "list", "an item\nwith a newline"});
+        run_logged(store, log, {"HSET", "hash", "field with spaces", "HSET 1 a 1 b"});
+        run_logged(store, log, {"SADD", "set", "member with spaces"});
+    }
+
+    Store restored;
+    std::string error;
+    check(redis_lite::replay_log(kLogPath, restored, error), "the log replays");
+    check_equal(error, "", "no error for awkward collection data");
+
+    check_equal(ordered_elements(run(restored, {"LRANGE", "list", "0", "-1"})),
+                "an item with spaces|an item\nwith a newline|",
+                "list items with spaces and newlines round-trip");
+    check_equal(run(restored, {"HGET", "hash", "field with spaces"}),
+                "$12\r\nHSET 1 a 1 b\r\n",
+                "a hash field with spaces, holding record-like text, round-trips");
+    check_equal(sorted_members(run(restored, {"SMEMBERS", "set"})), "member with spaces|",
+                "a set member with spaces round-trips");
 
     remove_log();
 }
@@ -1325,6 +1941,20 @@ int main() {
     test_missing_and_empty_logs();
     test_malformed_log_is_refused();
     test_binary_safe_keys_and_values();
+    test_lists();
+    test_list_ranges();
+    test_hashes();
+    test_sets();
+    test_wrong_type_errors();
+    test_ttl_with_every_type();
+    test_replacement_semantics();
+    test_persistence_of_collections();
+    test_persistence_of_collection_removals();
+    test_persistence_emptied_collections();
+    test_persistence_collection_ttl();
+    test_persistence_replay_is_still_read_only();
+    test_persistence_malformed_collection_records();
+    test_persistence_awkward_collection_data();
 
     std::cout << "\n";
     if (failures == 0) {
