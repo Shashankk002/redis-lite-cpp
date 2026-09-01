@@ -1,8 +1,10 @@
+#include <algorithm>
 #include <chrono>
 #include <iostream>
 #include <mutex>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "commands.hpp"
@@ -774,6 +776,10 @@ static void test_one_client_sets_another_gets() {
     check_equal(reader_reply, "$3\r\nbar\r\n", "the reading client saw the other client's value");
 }
 
+// The five sections above date from Stage 6, when the server ran one thread per
+// client. Stage 7 replaced that with a single-threaded event loop, so the server
+// no longer takes a lock -- but these still document that the store behaves
+// correctly under concurrent access, so they are kept.
 static void test_concurrent_pings() {
     std::cout << "\n-- independent PINGs --\n";
 
@@ -799,6 +805,140 @@ static void test_concurrent_pings() {
     }
     check(all_pong, "every client got its own +PONG");
     check(store.values.empty(), "PING touched no keys");
+}
+
+// ---------------------------------------------------------------------------
+// Stage 7: the event loop's per-client buffering, without any sockets.
+//
+// kqueue itself is not unit-tested here. What is testable is the logic the
+// event loop wraps around it: bytes accumulate in a per-client input buffer,
+// every complete request is executed, replies accumulate in a per-client
+// output buffer, and partial writes drain from the front of it.
+// ---------------------------------------------------------------------------
+
+// Mirrors handle_readable(): append what "arrived", run every complete request,
+// and append each reply to the output buffer.
+static void feed(Store& store,
+                 std::string& input,
+                 std::string& output,
+                 const std::string& arrived) {
+    input += arrived;
+
+    while (true) {
+        const ParseResult result = parse(input);
+        if (result.status != ParseStatus::Ok) {
+            break;
+        }
+        output += serialize(execute_command(result.value, store));
+        input.erase(0, result.consumed);
+    }
+}
+
+static void test_input_buffer_partial_reads() {
+    std::cout << "\n-- event loop: one request split across several reads --\n";
+
+    Store store;
+    std::string input;
+    std::string output;
+
+    run(store, {"SET", "foo", "bar"});
+
+    // The request arrives in three pieces, as TCP is entitled to deliver it.
+    feed(store, input, output, "*2\r\n$3\r\n");
+    check_equal(output, "", "nothing runs on the first fragment");
+    check_equal(input, "*2\r\n$3\r\n", "the fragment is held in the input buffer");
+
+    feed(store, input, output, "GET\r\n$3\r\n");
+    check_equal(output, "", "still nothing after the second fragment");
+
+    feed(store, input, output, "foo\r\n");
+    check_equal(output, "$3\r\nbar\r\n", "the request runs once the last byte arrives");
+    check_equal(input, "", "the input buffer is empty again");
+}
+
+static void test_input_buffer_pipelining() {
+    std::cout << "\n-- event loop: several requests in one read --\n";
+
+    Store store;
+    std::string input;
+    std::string output;
+
+    feed(store, input, output,
+         "*1\r\n$4\r\nPING\r\n"
+         "*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n"
+         "*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
+
+    check_equal(output, "+PONG\r\n+OK\r\n$3\r\nbar\r\n",
+                "all three replies are queued in order");
+    check_equal(input, "", "the whole read was consumed");
+}
+
+static void test_input_buffer_mixed() {
+    std::cout << "\n-- event loop: a complete request plus a fragment --\n";
+
+    Store store;
+    std::string input;
+    std::string output;
+
+    // One whole PING, then the beginning of a GET.
+    feed(store, input, output, "*1\r\n$4\r\nPING\r\n*2\r\n$3\r\nGET\r\n");
+
+    check_equal(output, "+PONG\r\n", "the complete request ran");
+    check_equal(input, "*2\r\n$3\r\nGET\r\n", "the fragment stayed buffered");
+
+    feed(store, input, output, "$7\r\nmissing\r\n");
+    check_equal(output, "+PONG\r\n$-1\r\n", "the second request ran when it completed");
+    check_equal(input, "", "the input buffer drained");
+}
+
+static void test_output_buffer_partial_writes() {
+    std::cout << "\n-- event loop: draining an output buffer in pieces --\n";
+
+    Store store;
+    std::string input;
+    std::string output;
+
+    // A value large enough that a real socket would not take it in one send().
+    const std::string big_value(50000, 'x');
+    run(store, {"SET", "big", big_value});
+    feed(store, input, output, "*2\r\n$3\r\nGET\r\n$3\r\nbig\r\n");
+
+    const std::string expected = "$50000\r\n" + big_value + "\r\n";
+    check(output == expected, "the whole large reply is queued in the output buffer");
+
+    // Simulate send() accepting only part of the buffer each time, which is
+    // exactly what a non-blocking socket does when its send buffer fills.
+    std::string delivered;
+    int write_calls = 0;
+    while (!output.empty()) {
+        const std::size_t accepted = std::min<std::size_t>(output.size(), 1024);
+        delivered.append(output, 0, accepted);
+        output.erase(0, accepted);
+        ++write_calls;
+    }
+
+    check(write_calls > 1, "a large reply really does need several writes");
+    check(delivered == expected, "the client receives every byte, in order");
+    check(output.empty(), "the output buffer is empty, so write interest can be dropped");
+}
+
+static void test_client_state_is_per_fd() {
+    std::cout << "\n-- event loop: clients do not share buffers --\n";
+
+    Store store;
+    std::unordered_map<int, std::string> input;
+    std::unordered_map<int, std::string> output;
+
+    // Client 4 sends half a request, client 5 sends a whole one in between.
+    feed(store, input[4], output[4], "*2\r\n$3\r\nGET\r\n");
+    feed(store, input[5], output[5], "*1\r\n$4\r\nPING\r\n");
+
+    check_equal(output[5], "+PONG\r\n", "the second client was served immediately");
+    check_equal(output[4], "", "the first client's half-request produced nothing");
+
+    // The interleaving did not disturb client 4's buffered fragment.
+    feed(store, input[4], output[4], "$7\r\nmissing\r\n");
+    check_equal(output[4], "$-1\r\n", "the first client's request completed correctly");
 }
 
 int main() {
@@ -837,6 +977,11 @@ int main() {
     test_concurrent_independent_keys();
     test_concurrent_shared_key();
     test_concurrent_ttl();
+    test_input_buffer_partial_reads();
+    test_input_buffer_pipelining();
+    test_input_buffer_mixed();
+    test_output_buffer_partial_writes();
+    test_client_state_is_per_fd();
 
     std::cout << "\n";
     if (failures == 0) {

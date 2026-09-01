@@ -13,21 +13,22 @@ over abstractions that might pay off later.
 
 ## Status
 
-**Stages 0–6 complete. A threaded server speaking Redis for a six-command subset, with TTL.**
+**Stages 0–7 complete. A single-threaded, event-driven server speaking Redis for a six-command subset, with TTL.**
 
 What exists today:
 
 - A CMake build (C++17, warnings enabled) producing four executables.
-- `redis-lite-server`, which listens on **127.0.0.1:6379**, serves **many clients at once**
-  (one thread each), and executes `PING`, `SET`, `GET`, `DEL`, `EXPIRE` and `TTL` over RESP
-  until Ctrl+C.
+- `redis-lite-server`, which listens on **127.0.0.1:6379**, serves **many clients at once from
+  a single thread** using a kqueue event loop, and executes `PING`, `SET`, `GET`, `DEL`,
+  `EXPIRE` and `TTL` over RESP until Ctrl+C.
 - A RESP2 parser and serializer (`src/resp.hpp`, `src/resp.cpp`), now driving the server.
 - A command layer (`src/commands.hpp`, `src/commands.cpp`) holding the key-value store and
   its expiration deadlines.
-- `redis-lite-tests`, a plain test executable wired into CTest (200 checks).
+- `redis-lite-tests`, a plain test executable wired into CTest (218 checks).
 - `tcp-echo-server` and `tcp-echo-client` in `experiments/` — the Stage 1 exercise, kept as-is.
 
-What does **not** exist yet: every other Redis command, persistence, and event-driven I/O.
+What does **not** exist yet: every other Redis command, persistence, and portability beyond
+macOS/BSD (see the note on `epoll` below).
 Every stage below marked *planned* describes intent, not shipped code.
 
 ## Stage 3: the RESP protocol
@@ -394,13 +395,155 @@ handling only those. That is event-driven I/O, and it is what would eventually r
 
 ### Demonstration script
 
-```bash
-./demo_concurrency.sh
+This stage's architecture was replaced in Stage 7; see below. The demonstration script is now
+`./demo_event_loop.sh`.
+
+## Stage 7: event-driven I/O with kqueue
+
+### Why one thread per client does not scale
+
+Stage 6 gave every connection its own thread. It works, and it is easy to read, but each thread
+reserves a large stack (commonly 512 KB to 8 MB) and the kernel must schedule all of them.
+Ten thousand mostly-idle clients means ten thousand threads whose only job is to sit blocked in
+`recv()` — an entire OS thread used to represent *waiting*.
+
+The insight behind event-driven I/O is that waiting does not need a thread. It needs a list.
+
+### Non-blocking sockets
+
+By default a socket is **blocking**: `recv()` does not return until data arrives. A single
+thread calling `recv()` on client A is therefore stuck until A speaks, and cannot serve anyone
+else — the exact problem Stage 6 solved with threads.
+
+`fcntl(fd, F_SETFL, flags | O_NONBLOCK)` changes that. A non-blocking `recv()` with no data
+available returns `-1` immediately with `errno == EAGAIN` (equivalently `EWOULDBLOCK`), which
+means "nothing right now, ask again later" rather than "an error occurred". The same applies to
+`accept()` and `send()`.
+
+That alone would only let us *poll* every socket in a busy loop, burning CPU. What is missing is
+a way to sleep until something is actually ready.
+
+### What kqueue is
+
+`kqueue` is the kernel's readiness-notification mechanism on macOS and the BSDs. You create one
+with `kqueue()` — it is itself a file descriptor — and then use `kevent()` for two purposes:
+
+- **registering interest**: "tell me when descriptor 7 is readable"
+- **waiting**: "sleep until any of the descriptors I registered is ready, then hand me the list"
+
+The kernel already knows which sockets have data, so it can answer this without the process
+polling anything. One thread can therefore supervise thousands of connections and be woken only
+for the handful that actually need work.
+
+```cpp
+const int kq = kqueue();
+
+struct kevent change;
+EV_SET(&change, fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, nullptr);
+kevent(kq, &change, 1, nullptr, 0, nullptr);          // register
+
+const int ready = kevent(kq, nullptr, 0, events.data(), events.size(), nullptr);   // wait
 ```
 
-It starts a server, connects a client that stays silent for 12 seconds, shows other clients
-being served during that window, then demonstrates shared state, two simultaneous clients on
-different keys, and TTL — then shuts everything down.
+**`EVFILT_READ`** means "this descriptor has something to read". On the *listening* socket that
+means a client is waiting to be accepted; on a *client* socket it means bytes have arrived (or,
+with `EV_EOF`, that the client hung up).
+
+**`EVFILT_WRITE`** means "there is room in this socket's send buffer". We register it **only
+when we have data we could not write**, and remove it as soon as the backlog drains — a socket
+with an empty send buffer is writable essentially always, so leaving the filter registered would
+wake the loop continuously for no reason.
+
+### The event loop
+
+```
+while (running) {
+    ready = kevent(...)                  // sleeps until something happens
+
+    for each ready event:
+        if it is the listening socket:
+            accept() until EAGAIN, register each new client for EVFILT_READ
+        else if EVFILT_READ:
+            recv() until EAGAIN, append to that client's input buffer
+            run every complete request in the buffer, append replies to its output buffer
+            try to send
+        else if EVFILT_WRITE:
+            send what is pending; if the buffer empties, drop the write filter
+}
+```
+
+Accepting **until `EAGAIN`** matters: several clients may have connected between two iterations,
+and the readiness notification only says "at least one", not how many.
+
+### Why each client needs its own buffers
+
+In Stage 6, `handle_client` was a function running on a dedicated thread, so a plain local
+variable could hold that connection's partially-received bytes — the thread's stack *was* the
+per-connection state.
+
+There is no such thread now. The event loop touches a client, returns to the loop, and may not
+come back for a while. So the state has to be stored explicitly:
+
+```cpp
+std::unordered_map<int, std::string> client_input;   // fd -> received, not yet parsed
+std::unordered_map<int, std::string> client_output;  // fd -> owed to the client
+```
+
+Both exist because TCP is a byte stream in both directions. An **input** buffer is needed because
+one request may arrive across several reads (`*2\r\n$3\r\nGET\r\n` now, `$3\r\nfoo\r\n`
+later), and because one read may contain several requests. An **output** buffer is needed
+because a non-blocking `send()` may accept only part of a large reply and then return `EAGAIN`;
+the remainder waits until `EVFILT_WRITE` says there is room.
+
+### Why the mutex is gone
+
+Stage 6 needed a mutex because several threads could reach into the store at the same moment.
+There is now exactly one thread again, so commands run strictly one after another and no
+interleaving is possible:
+
+```
+Stage 6:   thread A --+
+                      +--> shared Store      -> mutex required
+           thread B --+
+
+Stage 7:   event loop thread --> Store       -> no mutex needed
+```
+
+**This is concurrency in the networking, not in the execution.** Many connections are open and
+progressing at once, and the kernel tells the loop which ones need attention — but each command
+is executed sequentially on the one thread. Redis-Lite does not run two commands in parallel,
+and it never did: even in Stage 6 the mutex serialised them.
+
+### Why Linux would use epoll
+
+`kqueue` is a BSD interface: macOS, FreeBSD, OpenBSD, NetBSD. Linux does not have it, and uses
+`epoll` (`epoll_create1`, `epoll_ctl`, `epoll_wait`) for the same job; Windows uses I/O
+completion ports, which is a different model again. The *architecture* here — non-blocking
+sockets, readiness notification, one event loop, per-connection buffers — is the same on all
+three. Only the three or four syscalls differ. **This implementation is macOS/BSD-only.**
+
+### Known limitations
+
+- **macOS/BSD only.** No `epoll` fallback, so this does not build meaningfully on Linux.
+- **One event loop, one core.** A CPU-heavy command would stall every client, since there is no
+  other thread to run them. Real Redis has the same property and accepts it.
+- **Level-triggered, and buffers grow without limit.** A client can send an enormous bulk-string
+  header and the input buffer will keep growing; there is no maximum request size and no output
+  backpressure. Real servers cap both.
+- **No timer events.** Expiration is still lazy: an expired key is only removed when something
+  asks for it. kqueue has `EVFILT_TIMER`, which is the natural way to add active expiration, but
+  that is deliberately left for later.
+- **`accept()` is not rate-limited**, so a flood of connections can monopolise one iteration.
+
+### Demonstration
+
+```bash
+./demo_event_loop.sh
+```
+
+Shows an idle client not blocking others, shared state between clients, simultaneous clients,
+pipelining, a request split across two writes, a 200 KB reply that needs several writes,
+malformed input surviving, reconnection, and TTL.
 
 ## Trying the server
 
@@ -462,7 +605,7 @@ and port 6380 rather than 6379 so it never collides with a real Redis.
 | 4 | Core commands: `PING`, `SET`, `GET`, `DEL` | **Done** |
 | 5 | Expiration: `EXPIRE`, `TTL`, lazy eviction | **Done** |
 | 6 | Concurrency: one thread per client, mutex-guarded store | **Done** |
-| 7 | Event loop: non-blocking I/O in a single thread | Planned |
+| 7 | Event loop: non-blocking I/O with kqueue, single-threaded | **Done** |
 | 8 | Richer data types: lists, hashes, sets | Planned |
 | 9 | Persistence: snapshotting, and an append-only log | Planned |
 | 10 | Benchmarks and tuning | Planned |
@@ -477,7 +620,7 @@ Stage boundaries may shift; the table records the intended order.
 ├── include/         shared headers (empty until a header is needed)
 ├── tests/           test executable, run via CTest
 ├── experiments/     standalone learning exercises, not part of the server
-├── demo_concurrency.sh  scripted demonstration of concurrent clients
+├── demo_event_loop.sh   scripted demonstration of the event loop
 └── benchmarks/      reserved for a later stage; empty
 ```
 
