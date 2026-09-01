@@ -1,12 +1,3 @@
-// Benchmark client for redis-lite-server.
-//
-// Holds one persistent connection and sends real RESP requests, in two modes:
-//   sequential  one request, wait for the reply, repeat  (round-trip bound)
-//   pipelined   keep N requests in flight                (server throughput)
-//
-//   ./redis-lite-bench [--host H] [--port P] [--ops N]
-//                      [--pipeline D] [--value-size S] [--only NAME]
-
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
@@ -141,13 +132,8 @@ namespace {
         return true;
     }
 
-    // The sequential and pipelined phases must not share keys: reusing state
-    // from the first phase silently changes what the second one measures
-    // (a repeated SADD becomes a no-op, for instance). Each phase gets its own
-    // prefix.
     using RequestFor = std::function<std::string(const std::string&, int)>;
 
-    // Sends `ops` requests without timing them, to seed state the measured run needs.
     bool seed(Connection& connection, const RequestFor& request, const std::string& prefix,
               int ops, int depth) {
         int sent = 0;

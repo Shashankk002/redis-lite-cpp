@@ -4,12 +4,12 @@
 #include <netinet/in.h>     // sockaddr_in, htons, htonl
 #include <sys/event.h>      // kqueue, kevent, EV_SET
 #include <sys/socket.h>     // socket, bind, listen, accept, send, recv
-#include <unistd.h>         // close
+#include <unistd.h>
 
 #include <cerrno>
 #include <csignal>
 #include <cstdio>
-#include <cstring>      // std::strerror
+#include <cstring>
 #include <iostream>
 #include <string>
 #include <unordered_map>
@@ -24,13 +24,8 @@ namespace redis_lite {
 
     namespace {
 
-        // Per-client state. There is no longer a thread (and therefore no local
-        // variable) belonging to each connection, so the bytes a client has sent
-        // but not finished, and the bytes we owe it, have to live somewhere the
-        // event loop can find them again: keyed by file descriptor.
         using ClientBuffers = std::unordered_map<int, std::string>;
 
-        // What to do with a connection after reading from it.
         enum class AfterRead {
             KeepOpen,
             CloseWhenSent,  // the peer half-closed: reply first, then close
@@ -52,9 +47,6 @@ namespace redis_lite {
             sigaction(SIGTERM, &action, nullptr);
         }
 
-        // A blocking recv() would stop the whole server until one particular
-        // client speaks. With O_NONBLOCK the call returns EAGAIN instead, so the
-        // single thread can move on to whichever socket is actually ready.
         bool set_non_blocking(int fd) {
             const int flags = fcntl(fd, F_GETFL, 0);
             if (flags < 0) {
@@ -68,9 +60,6 @@ namespace redis_lite {
             return true;
         }
 
-        // Registers or removes one filter for one descriptor.
-        //   EVFILT_READ  -> tell me when there is something to read
-        //   EVFILT_WRITE -> tell me when there is room to write
         bool update_event(int kq, int fd, int16_t filter, uint16_t flags) {
             struct kevent change;
             EV_SET(&change, static_cast<uintptr_t>(fd), filter, flags, 0, 0, nullptr);
@@ -91,8 +80,6 @@ namespace redis_lite {
                           ClientBuffers& input,
                           ClientBuffers& output,
                           std::unordered_set<int>& closing) {
-            // close() alone would drop the registrations, but removing them
-            // explicitly keeps the lifecycle visible.
             update_event(kq, fd, EVFILT_READ, EV_DELETE);
             update_event(kq, fd, EVFILT_WRITE, EV_DELETE);
 
@@ -104,8 +91,6 @@ namespace redis_lite {
             std::cout << ("client closed (fd " + std::to_string(fd) + ")\n");
         }
 
-        // Writes as much of this client's pending output as the socket accepts.
-        // Returns false if the connection is broken and should be closed.
         bool try_send(int kq, int fd, ClientBuffers& output) {
             std::string& pending = output[fd];
 
@@ -131,9 +116,6 @@ namespace redis_lite {
             return true;
         }
 
-        // The listening socket is readable, which means at least one connection
-        // is waiting. Several may have arrived since the last loop iteration, so
-        // accept until the backlog is drained.
         void accept_clients(int kq, int listen_fd, ClientBuffers& input, ClientBuffers& output) {
             while (true) {
                 const int client_fd = accept(listen_fd, nullptr, nullptr);
@@ -165,8 +147,6 @@ namespace redis_lite {
             }
         }
 
-        // A client socket is readable. Drain it, run every complete request that
-        // is now buffered, and queue the replies.
         AfterRead handle_readable(int kq,
                                   int fd,
                                   Store& store,
@@ -184,10 +164,6 @@ namespace redis_lite {
                     continue;
                 }
                 if (received == 0) {
-                    // End of stream. The bytes already read are still a valid
-                    // request and must be answered before the socket is closed:
-                    // a client may legitimately send a command and immediately
-                    // shut down its write side while waiting for the reply.
                     std::cout << ("client finished sending (fd " + std::to_string(fd) + ")\n");
                     peer_finished = true;
                     break;
@@ -202,8 +178,6 @@ namespace redis_lite {
                 return AfterRead::CloseNow;
             }
 
-            // TCP is a byte stream: the buffer may now hold half a request,
-            // exactly one, or several. Run every complete one.
             std::string& buffer = input[fd];
             while (true) {
                 const ParseResult result = parse(buffer);
@@ -220,8 +194,6 @@ namespace redis_lite {
                     return AfterRead::CloseNow;  // out of sync; close, as Redis does
                 }
 
-                // Single-threaded again, so the store needs no lock. State-changing
-                // commands append themselves to the log before the reply goes out.
                 const RespValue reply = execute_command(result.value, store, &log);
                 output[fd] += serialize(reply);
 
@@ -239,8 +211,6 @@ namespace redis_lite {
     int run_server(uint16_t port, const std::string& log_path) {
         install_signal_handlers();
 
-        // Rebuild the store from the log before accepting anyone. A malformed
-        // file is fatal: starting with partial data would quietly lose keys.
         Store store;
         std::string replay_error;
         if (!replay_log(log_path, store, replay_error)) {
@@ -292,8 +262,6 @@ namespace redis_lite {
             return 1;
         }
 
-        // The kqueue itself is a file descriptor. We hand it descriptors we care
-        // about, and it hands back the ones that are ready.
         const int kq = kqueue();
         if (kq < 0) {
             perror("kqueue");
@@ -301,7 +269,6 @@ namespace redis_lite {
             return 1;
         }
 
-        // Readable on a listening socket means "a client is waiting to be accepted".
         if (!update_event(kq, listen_fd, EVFILT_READ, EV_ADD | EV_ENABLE)) {
             close(kq);
             close(listen_fd);
@@ -311,8 +278,6 @@ namespace redis_lite {
         ClientBuffers client_input;   // fd -> bytes received, not yet parsed
         ClientBuffers client_output;  // fd -> bytes owed to the client
 
-        // Clients that have stopped sending but are still owed a reply. Without
-        // this the reply would be thrown away the moment the peer half-closed.
         std::unordered_set<int> closing;
 
         std::cout << "Redis-Lite server listening on 127.0.0.1:" << port
@@ -321,7 +286,6 @@ namespace redis_lite {
         std::vector<struct kevent> events(64);
 
         while (g_running) {
-            // Blocks until at least one descriptor is ready, or a signal arrives.
             const int ready = kevent(kq,
                                      nullptr, 0,
                                      events.data(), static_cast<int>(events.size()),

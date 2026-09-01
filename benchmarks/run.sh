@@ -1,10 +1,3 @@
-#!/usr/bin/env bash
-#
-# Starts a fresh redis-lite-server, runs the benchmark against it, stops it.
-# Any extra arguments are passed through to redis-lite-bench.
-#
-#   ./benchmarks/run.sh --ops 20000 --pipeline 64
-
 set -u
 
 PORT="${PORT:-6379}"

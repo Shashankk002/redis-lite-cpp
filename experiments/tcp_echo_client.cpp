@@ -1,10 +1,3 @@
-// Stage 1 experiment: the client half of the same conversation.
-//
-// Connects to the echo server, sends one message, prints the reply, exits.
-//
-//   ./build/tcp-echo-client            (sends "hello")
-//   ./build/tcp-echo-client "ping me"
-
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <unistd.h>
