@@ -42,6 +42,13 @@ target_include_directories(redis-lite-tests PRIVATE include src)
 target_link_libraries(redis-lite-tests PRIVATE Threads::Threads)
 add_test(NAME redis-lite-tests COMMAND redis-lite-tests)
 
+add_executable(redis-lite-integration
+    tests/integration_test.cpp
+    src/resp.cpp)
+target_include_directories(redis-lite-integration PRIVATE src)
+add_test(NAME redis-lite-integration
+         COMMAND redis-lite-integration $<TARGET_FILE:redis-lite-server>)
+
 # Benchmark client.
 add_executable(redis-lite-bench
     benchmarks/bench.cpp

@@ -26,6 +26,10 @@ namespace redis_lite {
 
         using ClientBuffers = std::unordered_map<int, std::string>;
 
+        // Most a client may have buffered while a request is still incomplete.
+        // Without it, an unfinished request grows the buffer without bound.
+        constexpr std::size_t kMaxRequestBytes = 16 * 1024 * 1024;
+
         enum class AfterRead {
             KeepOpen,
             CloseWhenSent,  // the peer half-closed: reply first, then close
@@ -155,12 +159,21 @@ namespace redis_lite {
                                   ClientBuffers& output) {
             char chunk[4096];
             bool peer_finished = false;
+            std::string& buffer = input[fd];
 
             while (true) {
                 const ssize_t received = recv(fd, chunk, sizeof(chunk), 0);
 
                 if (received > 0) {
-                    input[fd].append(chunk, static_cast<std::size_t>(received));
+                    if (buffer.size() + static_cast<std::size_t>(received) > kMaxRequestBytes) {
+                        output[fd] += serialize(make_error(
+                            "ERR Protocol error: request larger than " +
+                            std::to_string(kMaxRequestBytes) + " bytes"));
+                        std::cout << ("request too large (fd " + std::to_string(fd) + ")\n");
+                        try_send(kq, fd, output);
+                        return AfterRead::CloseNow;
+                    }
+                    buffer.append(chunk, static_cast<std::size_t>(received));
                     continue;
                 }
                 if (received == 0) {
@@ -178,7 +191,6 @@ namespace redis_lite {
                 return AfterRead::CloseNow;
             }
 
-            std::string& buffer = input[fd];
             while (true) {
                 const ParseResult result = parse(buffer);
 
