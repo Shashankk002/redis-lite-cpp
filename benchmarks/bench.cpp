@@ -1,3 +1,4 @@
+#include <arpa/inet.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
@@ -54,7 +55,14 @@ namespace {
         sockaddr_in address{};
         address.sin_family = AF_INET;
         address.sin_port = htons(options.port);
-        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+        if (inet_pton(AF_INET, options.host.c_str(), &address.sin_addr) != 1) {
+            std::cerr << "benchmark: --host expects an IPv4 address, got '"
+                      << options.host << "'\n";
+            close(connection.fd);
+            connection.fd = -1;
+            return false;
+        }
 
         if (connect(connection.fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) < 0) {
             perror("connect");

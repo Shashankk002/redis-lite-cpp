@@ -199,6 +199,15 @@ static void test_incomplete_input() {
     check_status("*2\r\n$3\r\nGET\r\n", ParseStatus::Incomplete,
                  "an array missing its second element is incomplete");
 
+    // A count far larger than the input must be reported the same way a short
+    // bulk string is, without reserving room for the elements it claims.
+    check_status("*1000000000\r\n", ParseStatus::Incomplete,
+                 "an array count larger than the input is incomplete");
+    check_status("*9223372036854775807\r\n", ParseStatus::Incomplete,
+                 "an array count at the top of long long is incomplete");
+    check_status("*1000000000\r\n:1\r\n:2\r\n", ParseStatus::Incomplete,
+                 "a huge count with a few real elements is still incomplete");
+
     // The scenario that matters: one request split across two TCP reads.
     std::string buffer = "*2\r\n$3\r\nGET\r\n";
     check(parse(buffer).status == ParseStatus::Incomplete, "read 1 of 2 is incomplete");
@@ -1214,6 +1223,8 @@ static void test_malformed_log_is_refused() {
         {"NONSENSE 3 foo\n",                 "an unknown record type"},
         {"SET 3 foo\n",                      "a SET missing its value"},
         {"SET 99 foo 3 bar\n",               "a length longer than the data"},
+        {"SET 999999999999 x 3 bar\n",       "a length larger than the whole file"},
+        {"SET 3 foo 999999999999 x\n",       "a huge length on the value field"},
         {"SET 3 foo 3 bar",                   "a record with no trailing newline"},
         {"SET x foo 3 bar\n",                "a non-numeric length"},
         {"EXPIRE 3 foo notanumber\n",        "a non-numeric deadline"},
@@ -1837,6 +1848,7 @@ static void test_persistence_malformed_collection_records() {
         {"LPUSH 4 list\n",               "an LPUSH missing its value"},
         {"SADD 3 set\n",                 "an SADD missing its member"},
         {"HSET 4 hash 99 field 1 v\n",   "an HSET field length past the end"},
+        {"HSET 4 hash 999999999999 f 1 v\n", "a huge declared field length"},
         {"LPOP 4 list 1 x\n",            "an LPOP with a stray extra argument"},
         {"ZADD 3 key 1 m\n",             "a verb we do not implement"},
     };

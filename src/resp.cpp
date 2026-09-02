@@ -1,5 +1,6 @@
 #include "resp.hpp"
 
+#include <algorithm>
 #include <charconv>  // std::from_chars
 
 namespace redis_lite {
@@ -134,7 +135,13 @@ namespace redis_lite {
                         return ParseStatus::Malformed;
                     }
 
-                    out.elements.reserve(static_cast<std::size_t>(count));
+                    // Every element costs at least one byte, so the input cannot
+                    // hold more than this many. Bounding the reserve stops a bogus
+                    // count from sizing an allocation; a short array is still
+                    // reported Incomplete once its elements run out.
+                    const std::size_t reservable =
+                        std::min(static_cast<std::size_t>(count), input.size() - pos);
+                    out.elements.reserve(reservable);
                     for (long long i = 0; i < count; ++i) {
                         RespValue element;
                         const ParseStatus status = parse_value(input, pos, element, error);

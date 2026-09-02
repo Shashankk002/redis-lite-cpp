@@ -58,12 +58,18 @@ namespace redis_lite {
             log << text.size() << ' ' << text;
         }
 
-        bool read_field(std::istream& in, std::string& out) {
+        bool read_field(std::istream& in, std::streamoff limit, std::string& out) {
             long long length = -1;
             if (!(in >> length) || length < 0) {
                 return false;
             }
             if (in.get() != ' ') {
+                return false;
+            }
+
+            
+            const std::streamoff here = in.tellg();
+            if (here < 0 || length > limit - here) {
                 return false;
             }
 
@@ -131,6 +137,14 @@ namespace redis_lite {
             return true;  // no file yet: a fresh server starts empty
         }
 
+        in.seekg(0, std::ios::end);
+        const std::streamoff file_size = in.tellg();
+        in.seekg(0, std::ios::beg);
+        if (file_size < 0) {
+            error = "cannot determine the size of " + path;
+            return false;
+        }
+
         Store loaded;
         long long record_number = 0;
 
@@ -147,7 +161,7 @@ namespace redis_lite {
             }
 
             std::string key;
-            if (!read_field(in, key)) {
+            if (!read_field(in, file_size, key)) {
                 error = record_error(record_number, "bad key field");
                 return false;
             }
@@ -194,7 +208,7 @@ namespace redis_lite {
                 }
 
                 std::string argument;
-                if (!read_field(in, argument)) {
+                if (!read_field(in, file_size, argument)) {
                     error = record_error(record_number,
                                          "bad argument " + std::to_string(i + 1));
                     return false;

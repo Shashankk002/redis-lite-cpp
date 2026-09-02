@@ -15,7 +15,7 @@ if [ ! -x "$SERVER" ] || [ ! -x "$BENCH" ]; then
 fi
 
 rm -f "$AOF"
-"$SERVER" "$AOF" > "$SERVER_LOG" 2>&1 &
+"$SERVER" "$AOF" "$PORT" > "$SERVER_LOG" 2>&1 &
 SERVER_PID=$!
 trap 'kill -INT "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null' EXIT
 sleep 0.6
