@@ -1902,6 +1902,76 @@ static void test_persistence_awkward_collection_data() {
     remove_log();
 }
 
+// Builds `levels` nested single-element arrays wrapping an integer leaf.
+static std::string nested_array(int levels) {
+    std::string out;
+    out.reserve(static_cast<std::size_t>(levels) * 4 + 4);
+    for (int i = 0; i < levels; ++i) {
+        out += "*1\r\n";
+    }
+    out += ":1\r\n";
+    return out;
+}
+
+static void test_nesting_depth_limit() {
+    std::cout << "\n-- RESP nesting depth --\n";
+
+    check_status(nested_array(4), ParseStatus::Ok, "a few levels of nesting parse");
+    check_status(nested_array(127), ParseStatus::Ok, "nesting at the limit still parses");
+    check_status(nested_array(128), ParseStatus::Malformed,
+                 "one level past the limit is malformed");
+
+    // These depths used to exhaust the stack and take the server down.
+    check_status(nested_array(20000), ParseStatus::Malformed,
+                 "20000 levels is malformed, not a crash");
+    check_status(nested_array(50000), ParseStatus::Malformed,
+                 "50000 levels is malformed, not a crash");
+
+    const ParseResult deep = parse(nested_array(20000));
+    check(!deep.error.empty(), "the depth failure explains itself");
+
+    // The limit must not disturb ordinary nested replies.
+    check_round_trip("*2\r\n*2\r\n:1\r\n:2\r\n+OK\r\n", "an ordinary nested array");
+}
+
+static void test_expire_rejects_unrepresentable_deadlines() {
+    std::cout << "\n-- EXPIRE range --\n";
+
+    Store store;
+    run(store, {"SET", "k", "v"});
+
+    // The clock cannot hold a deadline further out than this.
+    const long long max_seconds = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::time_point::max() -
+        std::chrono::steady_clock::now()).count();
+
+    check(run(store, {"EXPIRE", "k", std::to_string(max_seconds + 1)})
+              .rfind("-ERR value is not an integer", 0) == 0,
+          "one second past the representable range is rejected");
+    check_equal(run(store, {"GET", "k"}), "$1\r\nv\r\n", "the rejected EXPIRE left the key alone");
+    check_equal(run(store, {"TTL", "k"}), ":-1\r\n", "and set no expiration");
+
+    check(run(store, {"EXPIRE", "k", "9223372036854775807"})
+              .rfind("-ERR value is not an integer", 0) == 0,
+          "the largest long long is rejected");
+    check_equal(run(store, {"GET", "k"}), "$1\r\nv\r\n", "the key survived that too");
+    check_equal(run(store, {"TTL", "k"}), ":-1\r\n", "still no expiration");
+
+    check_equal(run(store, {"EXPIRE", "k", std::to_string(max_seconds - 60)}), ":1\r\n",
+                "a value just inside the range is accepted");
+    check(run(store, {"TTL", "k"}).rfind(":", 0) == 0, "TTL reports a number for it");
+    check_equal(run(store, {"GET", "k"}), "$1\r\nv\r\n", "the key is still readable");
+
+    // Zero and negative keep deleting, exactly as before.
+    check_equal(run(store, {"EXPIRE", "k", "0"}), ":1\r\n", "EXPIRE 0 still deletes");
+    check_equal(run(store, {"GET", "k"}), "$-1\r\n", "the key is gone");
+
+    run(store, {"SET", "k2", "v"});
+    check_equal(run(store, {"EXPIRE", "k2", "-9223372036854775808"}), ":1\r\n",
+                "the most negative value still deletes");
+    check_equal(run(store, {"GET", "k2"}), "$-1\r\n", "that key is gone too");
+}
+
 int main() {
     std::cout << "running tests\n";
 
@@ -1914,6 +1984,7 @@ int main() {
     test_incomplete_input();
     test_malformed_input();
     test_crlf_handling();
+    test_nesting_depth_limit();
     test_serialization();
     test_round_trips();
     test_ping();
@@ -1931,6 +2002,7 @@ int main() {
     test_del_clears_ttl();
     test_expire_edge_values();
     test_expire_and_ttl_errors();
+    test_expire_rejects_unrepresentable_deadlines();
     test_independent_expirations();
     test_ttl_over_resp();
     test_concurrent_pings();

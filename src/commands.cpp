@@ -162,6 +162,15 @@ namespace redis_lite {
                 return not_an_integer();
             }
 
+            // A deadline past what the clock can hold would overflow the
+            // duration arithmetic below.
+            const auto now = Clock::now();
+            const long long max_seconds = std::chrono::duration_cast<std::chrono::seconds>(
+                                              Clock::time_point::max() - now).count();
+            if (seconds > max_seconds) {
+                return not_an_integer();
+            }
+
             const std::string& key = request.elements[1].string;
             expire_if_due(store, key);
 
@@ -175,7 +184,7 @@ namespace redis_lite {
                 return make_integer(1);
             }
 
-            store.expirations[key] = Clock::now() + std::chrono::seconds(seconds);
+            store.expirations[key] = now + std::chrono::seconds(seconds);
             log_expire(log, key, seconds);
             return make_integer(1);
         }

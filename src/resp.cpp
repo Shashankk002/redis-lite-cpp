@@ -36,10 +36,19 @@ namespace redis_lite {
             return result.ec == std::errc() && result.ptr == text.data() + text.size();
         }
 
+        // Arrays nest, and each level costs a stack frame. Redis uses the same
+        // limit to keep a deeply nested request from exhausting the stack.
+        constexpr int kMaxDepth = 128;
+
         ParseStatus parse_value(std::string_view input,
                                 std::size_t& pos,
                                 RespValue& out,
-                                std::string& error) {
+                                std::string& error,
+                                int depth) {
+            if (depth > kMaxDepth) {
+                error = "nesting is deeper than " + std::to_string(kMaxDepth) + " levels";
+                return ParseStatus::Malformed;
+            }
             if (pos >= input.size()) {
                 return ParseStatus::Incomplete;
             }
@@ -144,7 +153,8 @@ namespace redis_lite {
                     out.elements.reserve(reservable);
                     for (long long i = 0; i < count; ++i) {
                         RespValue element;
-                        const ParseStatus status = parse_value(input, pos, element, error);
+                        const ParseStatus status =
+                            parse_value(input, pos, element, error, depth + 1);
                         if (status != ParseStatus::Ok) {
                             return status;  // Incomplete or Malformed, unchanged
                         }
@@ -165,7 +175,7 @@ namespace redis_lite {
         ParseResult result;
         std::size_t pos = 0;
 
-        result.status = parse_value(input, pos, result.value, result.error);
+        result.status = parse_value(input, pos, result.value, result.error, 1);
         if (result.status == ParseStatus::Ok) {
             result.consumed = pos;
         }
