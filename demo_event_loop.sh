@@ -5,7 +5,7 @@
 # Starts its own server, runs clients against it, then shuts it down.
 # Usage:  ./demo_event_loop.sh
 
-set -u
+set -eu
 
 HOST=127.0.0.1
 PORT="${PORT:-6379}"
@@ -22,19 +22,52 @@ send() {
     printf "$1" | nc -w2 "$HOST" "$PORT" | cat -v
 }
 
+LAST_REPLY=""
+FAILURES=0
+
+# Sends a request, prints "  LABEL -> reply", and keeps it in LAST_REPLY.
+show() {
+    LAST_REPLY="$(printf "$2" | nc -w2 "$HOST" "$PORT" | cat -v | tr '\n' ' ')"
+    printf '  %-30s -> %s\n' "$1" "$LAST_REPLY"
+}
+
+# Fails the script if the last reply did not contain what we expect.
+assert_reply() {
+    if printf '%s' "$LAST_REPLY" | grep -qF -- "$1"; then
+        printf '      ok: %s\n' "$2"
+    else
+        printf '      FAILED: %s\n' "$2"
+        printf '        expected to contain: %s\n' "$1"
+        printf '        actual:              %s\n' "$LAST_REPLY"
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+
+assert_equal() {
+    if [ "$1" = "$2" ]; then
+        printf '      ok: %s\n' "$3"
+    else
+        printf '      FAILED: %s (expected "%s", got "%s")\n' "$3" "$2" "$1"
+        FAILURES=$((FAILURES + 1))
+    fi
+}
+
 IDLE_PID=""
 cleanup() {
     # Disconnect clients first, then Ctrl+C the server.
-    [ -n "$IDLE_PID" ] && kill "$IDLE_PID" 2>/dev/null
+    if [ -n "$IDLE_PID" ]; then
+        kill "$IDLE_PID" 2>/dev/null || true
+    fi
     sleep 0.3
-    kill -INT "$SERVER_PID" 2>/dev/null
-    wait "$SERVER_PID" 2>/dev/null
+    kill -INT "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
 
     # Printed only now: the server's stdout is block-buffered into the log
     # file, so nothing is flushed until it exits.
     echo
     echo "server log (tail):"
     tail -12 "$LOG" | sed 's/^/  /'
+    return 0
 }
 
 echo "starting $SERVER on $HOST:$PORT"
@@ -42,7 +75,7 @@ echo "starting $SERVER on $HOST:$PORT"
 SERVER_PID=$!
 trap cleanup EXIT
 sleep 0.5
-printf '*1\r\n$4\r\nPING\r\n' | nc -w2 "$HOST" "$PORT" > /dev/null 2>&1   # warm-up
+printf '*1\r\n$4\r\nPING\r\n' | nc -w2 "$HOST" "$PORT" > /dev/null 2>&1 || true   # warm-up
 
 echo
 echo "=== 1. an idle client does not block anybody else ==="
@@ -53,8 +86,8 @@ sleep 0.5
 echo "client A connected (pid $IDLE_PID) and is sending nothing at all"
 
 for i in 1 2 3; do
-    printf "  %s  client B: PING -> " "$(date +%T)"
-    send '*1\r\n$4\r\nPING\r\n'
+    show "$(date +%T)  client B: PING" '*1\r\n$4\r\nPING\r\n'
+    assert_reply '+PONG' 'B is served while A stays idle'
 done
 
 if kill -0 "$IDLE_PID" 2>/dev/null; then
@@ -65,8 +98,8 @@ echo
 echo "=== 2. clients share one store ==="
 printf "  client A: SET foo bar -> "
 send '*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n'
-printf "  client B: GET foo     -> "
-send '*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n'
+show 'client B: GET foo' '*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n'
+assert_reply 'bar' "one client reads another client's write"
 
 echo
 echo "=== 3. two clients at the same time, different keys ==="
@@ -82,10 +115,9 @@ echo "  client D: SET k2 v2 / GET k2 -> $(tr -d '\n' < /tmp/redis-lite-client-d.
 
 echo
 echo "=== 4. pipelining: PING + SET + GET in ONE write ==="
-printf "  -> "
-send '*1\r\n$4\r\nPING\r\n*3\r\n$3\r\nSET\r\n$3\r\npip\r\n$3\r\nyes\r\n*2\r\n$3\r\nGET\r\n$3\r\npip\r\n' \
-    | tr -d '\n'
-echo
+show 'PING + SET + GET' '*1\r\n$4\r\nPING\r\n*3\r\n$3\r\nSET\r\n$3\r\npip\r\n$3\r\nyes\r\n*2\r\n$3\r\nGET\r\n$3\r\npip\r\n'
+assert_reply '+PONG' 'the pipelined PING was answered'
+assert_reply 'yes' 'the pipelined GET saw the pipelined SET'
 
 echo
 echo "=== 5. ONE request split across TWO writes, half a second apart ==="
@@ -103,6 +135,7 @@ BYTES=$( { printf '*3\r\n$3\r\nSET\r\n$3\r\nbig\r\n$200000\r\n'
          } | nc -w2 "$HOST" "$PORT" | wc -c )
 echo "  SET a 200000-byte value, then GET it back"
 echo "  bytes received: $(echo "$BYTES" | tr -d ' ')   (expected 200016: +OK + \$200000 header + payload + CRLF)"
+assert_equal "$(echo "$BYTES" | tr -d ' ')" '200016' 'the whole large reply came back'
 
 echo
 echo "=== 7. malformed input does not take the server down ==="
@@ -110,8 +143,8 @@ printf "  garbage       -> "
 send '!garbage\r\n'
 printf "  raw text      -> "
 send 'hello world\r\n'
-printf "  still alive   -> "
-send '*1\r\n$4\r\nPING\r\n'
+show 'still alive' '*1\r\n$4\r\nPING\r\n'
+assert_reply '+PONG' 'the server survived the malformed input'
 
 echo
 echo "=== 8. disconnect, then reconnect ==="
@@ -137,3 +170,10 @@ echo "=== 10. the server is still healthy ==="
 printf "  PING / GET foo -> "
 send '*1\r\n$4\r\nPING\r\n*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n' | tr -d '\n'
 echo
+
+echo
+if [ "$FAILURES" -ne 0 ]; then
+    echo "$FAILURES assertion(s) failed"
+    exit 1
+fi
+echo "all assertions passed"
