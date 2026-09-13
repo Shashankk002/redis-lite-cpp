@@ -35,15 +35,9 @@ namespace redis_lite {
 
     struct ParseResult {
         ParseStatus status = ParseStatus::Incomplete;
-
-        
-        RespValue value; // Meaningful only when status == Ok.
-
-        
-        std::size_t consumed = 0; // How many bytes of the input that value used.
-        // from the front of its buffer; whatever remains is the next request.
-
-        std::string error;
+        RespValue value;           // meaningful only when status == Ok
+        std::size_t consumed = 0;  // bytes used by that value; the caller drops them
+        std::string error;         // set when status == Malformed
     };
 
     // Parses the first RESP value in `input`.

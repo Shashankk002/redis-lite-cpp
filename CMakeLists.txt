@@ -15,10 +15,10 @@ endif()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-# Development warnings, applied to everything we build. GCC and Clang only;
+# Development warnings for everything we build (GCC/Clang flags).
 add_compile_options(-Wall -Wextra -Wpedantic)
 
-# The server is single-threaded again (Stage 7), but the tests still exercise
+# The server is single-threaded; only the tests use std::thread.
 find_package(Threads REQUIRED)
 
 # The server.
@@ -28,7 +28,6 @@ add_executable(redis-lite-server
     src/resp.cpp
     src/commands.cpp
     src/persistence.cpp)
-target_include_directories(redis-lite-server PRIVATE include)
 
 # The tests. Plain executable; a non-zero exit code means failure, which is all
 # CTest looks at.
@@ -38,7 +37,7 @@ add_executable(redis-lite-tests
     src/resp.cpp
     src/commands.cpp
     src/persistence.cpp)
-target_include_directories(redis-lite-tests PRIVATE include src)
+target_include_directories(redis-lite-tests PRIVATE src)
 target_link_libraries(redis-lite-tests PRIVATE Threads::Threads)
 add_test(NAME redis-lite-tests COMMAND redis-lite-tests)
 

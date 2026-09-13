@@ -19,8 +19,8 @@ persistence, testing, and performance measurement.
 - **TTL expiration** with lazy eviction
 - **Append-only persistence (AOF)** with replay and corrupt-log detection
 - **Pipelining and partial I/O** through per-client input/output buffers
-- **474 automated checks** covering parsing, commands, expiration, persistence,
-  networking, and data types
+- **494 unit checks** plus an integration test that drives the real server
+  over TCP
 - **Benchmark harness** for sequential and pipelined workloads
 
 ## Architecture
@@ -166,6 +166,11 @@ multiple `recv()` calls.
 Pipelined requests are handled by repeatedly parsing complete values from the
 same input buffer.
 
+Two limits protect the server from hostile input: arrays may nest at most 128
+levels deep (deeper input is rejected as malformed rather than exhausting the
+stack), and a client may have at most 16 MiB of an unfinished request buffered
+before it is disconnected.
+
 ### Typed keyspace
 
 Each key stores exactly one of:
@@ -203,6 +208,11 @@ SET    <key-length> <key> <value-length> <value>
 DEL    <key-length> <key>
 EXPIRE <key-length> <key> <unix-deadline>
 ```
+
+List, hash, and set mutations (`LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `HSET`,
+`HDEL`, `SADD`, `SREM`) use the same verb-plus-length-prefixed-arguments
+shape. Commands that change nothing, such as a duplicate `SADD`, are not
+recorded.
 
 The log is replayed at startup through the same command execution path used by
 normal clients, keeping replay semantics consistent with live execution.
@@ -257,7 +267,7 @@ actual bottlenecks through measurement rather than guessing.
 
 ## Testing
 
-The project contains **474 automated checks** covering:
+The unit suite contains **494 checks** covering:
 
 - RESP parsing and serialization
 - Partial and malformed input
@@ -268,9 +278,11 @@ The project contains **474 automated checks** covering:
 - AOF persistence and replay
 - Corrupt persistence records
 - Large requests and responses
-- Networking and event-loop behavior
 
-Tests are run through CTest:
+A separate integration test (`tests/integration_test.cpp`) starts the real
+server binary and exercises it over TCP: ordinary commands, pipelining, a
+multi-megabyte request, the request-size limit, and recovery after a
+misbehaving client. Both are registered with CTest:
 
 ```bash
 cmake -S . -B build
@@ -280,9 +292,10 @@ ctest --test-dir build --output-on-failure
 
 Both Debug and Release builds are verified with zero compiler warnings.
 
-The parser and persistence hardening also includes mutation-style regression
-checks to ensure the tests actually distinguish vulnerable implementations
-from fixed implementations.
+The regression tests for the parser, persistence, and request-limit fixes
+were each checked against a deliberately broken build during development to
+confirm they fail when the bug is present. That verification was manual; the
+repository does not include mutation tooling.
 
 ## Build & Run
 
@@ -347,8 +360,9 @@ features:
 ./demo_datatypes.sh
 ```
 
-They start the server, exercise the relevant functionality, and clean up
-after themselves.
+They start the server, exercise the relevant functionality, assert a
+representative set of replies, and clean up after themselves. Each exits
+non-zero if an expected reply is wrong.
 
 ## Benchmarking
 
@@ -382,7 +396,8 @@ redis-lite-cpp/
 │   ├── persistence.cpp
 │   └── persistence.hpp
 ├── tests/
-│   └── tests.cpp
+│   ├── tests.cpp
+│   └── integration_test.cpp
 ├── benchmarks/
 │   ├── bench.cpp
 │   └── run.sh
@@ -433,7 +448,7 @@ Current limitations include:
 - No transactions or pub/sub
 - No sorted sets
 - Some Redis commands and advanced data-type operations are not implemented
-- Client input/output buffers do not currently have hard size limits
+- Client output buffers have no hard size limit (input is capped at 16 MiB)
 
 These are deliberate boundaries for the project rather than attempts to claim
 feature parity with Redis.

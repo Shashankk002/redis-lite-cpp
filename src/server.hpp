@@ -6,11 +6,9 @@
 
 namespace redis_lite {
 
-// Runs the TCP server on 127.0.0.1:<port> until Ctrl+C.
-//
-// Blocking and sequential: one client is handled from connect to disconnect
-// before the next one is accepted. Returns 0 on a clean shutdown, 1 on error.
-int run_server(uint16_t port, const std::string& log_path);
+    // Replays the log, then runs the event loop on 127.0.0.1:<port> until
+    // SIGINT or SIGTERM. Returns 0 on a clean shutdown, 1 if startup fails.
+    int run_server(uint16_t port, const std::string& log_path);
 
 }  // namespace redis_lite
 
